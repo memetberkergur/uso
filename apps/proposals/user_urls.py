@@ -10,6 +10,7 @@ urlpatterns = [
     path('proposals/<slug:slug>/clone/', views.CloneProposal.as_view(), name='clone-proposal'),
     path('proposals/<slug:slug>/delete/', views.DeleteProposal.as_view(), name='delete-proposal'),
     path('proposals/<slug:slug>/submit/', views.SubmitProposal.as_view(), name='submit-proposal'),
+    path('proposals/<slug:slug>/withdraw/', views.WithdrawProposal.as_view(), name='withdraw-proposal'),
 
     path('proposals/<int:pk>/clarifications/new/', views.AskClarification.as_view(), name='request-proposal-clarification'),
     path('proposals/<int:ref>/clarifications/<int:pk>/response/', views.AnswerClarification.as_view(), name='proposal-clarification-response'),
