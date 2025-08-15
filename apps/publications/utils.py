@@ -1,585 +1,1059 @@
-
-from io import BytesIO, StringIO
-from collections import defaultdict
-from datetime import date
+import codecs
 import csv
+import itertools
 import json
+import operator
 import os
+import pickle
 import re
+import time
+from collections import defaultdict
+from datetime import date, timedelta
+from functools import reduce
+from io import BytesIO
+from pathlib import Path
+
+import pandas as pd
 import requests
-import subprocess
-from lxml import etree
+from charset_normalizer.md import lru_cache
+from dateutil import parser
 from django.conf import settings
-from django.utils import timezone
+from django.db import transaction
+from django.db.models import Q, QuerySet
+from django.utils import dateparse, timezone
+from habanero import Crossref
+from lxml import etree
+from rcsbapi.search import search_attributes as attrs
 
-debug = False
+from misc.utils import MultiKeyDict
+from . import models
 
-KEYWORD_XPATH = {
-    '10.1088': '/html/body/div[4]/div/div/div[1]/div[8]/dl/dd[2]/p',
-    '10.1117': '/html/body//div[@class="header"]/a',
-    '10.1149': '/html/body//a[@class="kwd-search"]',
-    '10.1107': '/html/body/p[3]/b/a',
-    '10.1016': '//*[@class="svKeywords"]',
+PDB_SITE = getattr(settings, 'USO_PDB_SITE', 'CLSI')
+PDB_SITE_MAP = getattr(settings, 'USO_PDB_SITE_MAP', {})
+
+CROSSREF_API_EMAIL = getattr(settings, 'CROSSREF_API_EMAIL', '')
+OPEN_CITATIONS_API_KEY = getattr(settings, 'OPEN_CITATIONS_API_KEY', None)
+CROSSREF_THROTTLE = getattr(settings, 'CROSSREF_THROTTLE', 0.025)  # time delay between crossref calls
+CROSSREF_BATCH_SIZE = getattr(settings, 'CROSSREF_BATCH_SIZE', 10)
+GOOGLE_API_KEY = getattr(settings, 'GOOGLE_API_KEY', None)
+
+OPEN_CITATIONS_URL = "https://opencitations.net/index/api/v2/"
+CROSSREF_EVENTS_URL = "https://api.eventdata.crossref.org/v1/events/distinct"
+CROSSREF_CITATIONS_URL = "https://www.crossref.org/openurl/"
+PDB_SEARCH_URL = getattr(settings, 'PDB_SEARCH_URL', "https://search.rcsb.org/rcsbsearch/v2/query")
+PDB_REPORT_URL = getattr(settings, 'PDB_REPORT_URL', "https://data.rcsb.org/graphql")
+GOOGLE_BOOKS_API = getattr(settings, 'GOOGLE_BOOKS_API', "https://www.googleapis.com/books/v1/volumes")
+SCIMAGO_URL = getattr(settings, 'SCIMAGO_URL', "https://www.scimagojr.com/journalrank.php")
+
+SEARCH_JSON = {
+  "query": {
+    "type": "terminal",
+    "service": "text",
+    "parameters": {
+      "operator": "exact_match",
+      "negation": False,
+      "value": f"{PDB_SITE}",
+      "attribute": "diffrn_source.pdbx_synchrotron_site"
+    }
+  },
+  "return_type": "entry",
+  "request_options": {
+    "return_all_hits": True
+  }
 }
 
-USO_PDB_FACILITIES = getattr(settings, 'USO_PDB_FACILITIES', {})
-GOOGLE_API_KEY = getattr(settings, 'GOOGLE_API_KEY', '')
+REPORT_QUERY = """{{
+  entries(entry_ids: [{0}]) {{
+    rcsb_id
+    struct {{
+      title
+    }}
+    rcsb_accession_info {{
+      initial_release_date
+      deposit_date
+    }}
+    rcsb_entry_info {{
+      diffrn_resolution_high {{
+        provenance_source
+        value
+      }}
+    }}
+    diffrn_detector {{
+      pdbx_collection_date
+    }}
+    diffrn_source {{
+      pdbx_synchrotron_beamline
+      pdbx_synchrotron_site
+    }}
+    rcsb_primary_citation {{
+      rcsb_authors
+      pdbx_database_id_DOI
+      year
+    }}
+  }}
+}}"""
+
+PDB_QUERY_DATA = [
+    'rcsb_id',
+    'struct.title',
+    'rcsb_primary_citation.rcsb_authors',
+    'rcsb_primary_citation.pdbx_database_id_DOI',
+    'rcsb_accession_info.initial_release_date',
+    'diffrn_source.pdbx_synchrotron_beamline',
+    'diffrn_source.pdbx_synchrotron_site',
+]
 
 
-def join_names(authors):
-    return '; '.join(a['name'] for a in authors)
+def flatten(d, parent_key='') -> dict:
+    """
+    Flattens a nested dictionary, concatenating keys with dots.
+
+    :param d: The dictionary to flatten.
+    :param parent_key: The prefix for keys (used in recursion).
+    :return: A flat dictionary with dot-separated keys.
+    """
+    items = {}
+    for k, v in d.items():
+        new_key = f"{parent_key}.{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.update(flatten(v, new_key))
+        else:
+            items[new_key] = v
+    return items
 
 
-def join_strings(authors):
-    if isinstance(authors, list):
-        return '; '.join(authors)
-    return authors
+class CrossRef(Crossref):
+    def __init__(self):
+        super().__init__(mailto=CROSSREF_API_EMAIL, ua_string='USO')
+
+    def mentions(self, doi, year=None):
+        headers = {
+            'Accept': 'application/json',
+        }
+        params = {
+            'mailto': self.mailto,
+            'obj-id': doi,
+            'rows': 1000,
+        }
+        if year:
+            params['from-occurred-date'] = f'{year}-01-01'
+            params['until-occurred-date'] = f'{year}-12-31'
+
+        events = []
+        more_results = True
+        while more_results:
+            response = requests.get(CROSSREF_EVENTS_URL, params=params, headers=headers)
+            if response.status_code == 200:
+                result = response.json()
+                message = result.get('message', {})
+                new_events = message.get('events', [])
+                events.extend(new_events)
+                total_events = message.get('total-results', 0)
+                more_results = len(new_events) and (len(events) < total_events)
+                params['cursor'] = message.get('next-cursor', None)
+            else:
+                more_results = False
+        if not events:
+            return {}
+
+        df = pd.DataFrame(events)
+        df['year'] = df.timestamp.str[:4]
+        mentions = df.groupby('year').size().to_dict()
+
+        if year:
+            # if year is specified, return only that year
+            return mentions.get(str(year), 0)
+        return mentions
 
 
-def join_creators(authors):
-    return '; '.join([a['name'] for a in authors if 'name' in a])
+class OpenCitations:
+    def __init__(self, api_key=None, rate_limit=10):
+        self.rate_limit = rate_limit
+        self.api_key = api_key or OPEN_CITATIONS_API_KEY
+        self.base_url = OPEN_CITATIONS_URL
+        self.headers = {
+            'Accept': 'application/json',
+            'authorization': self.api_key,
+        }
+
+    def citations_list(self, doi, year: int = None) -> list[dict]:
+        """
+        Get the list of citations for a given DOI from OpenCitations API.
+
+        :param doi: The DOI of the publication.
+        :param year: Optional year to filter results by.
+        :return: Citations as a list of dicts
+        """
+        filters = '?filter=creation={year}' if year else ''
+        url = f"{self.base_url}citations/doi:{doi}{filters}"
+        response = requests.get(url, headers=self.headers)
+        if response.status_code == 200:
+            data = response.json()
+            return data
+        else:
+            print(f"Error fetching citations for {doi}: {response.status_code}")
+            return []
+
+    def citations(self, doi, year: int = None) -> dict:
+        """
+        Get the number of citations for a given DOI from OpenCitations API.
+        :param doi: The DOI of the publication.
+        :param year: Optional year to filter results by.
+        :return: dictionary mapping a year to a dictionary containing the number of citations
+        """
+        citations = self.citations_list(doi, year=year)
+        if not citations:
+            return {}
+
+        df = pd.DataFrame(citations)
+        df['year'] = df.creation.str[:4]
+        all_cites = df.groupby('year').size().to_dict()
+        self_cites = df.loc[df['author_sc'] == 'yes'].groupby('year').size().to_dict()
+        years = set(all_cites.keys()).union(set(self_cites.keys()))
+        info = {
+            yr: {
+                'citations': all_cites.get(yr, 0),
+                'self_cites': self_cites.get(yr, 0)
+            }
+            for yr in sorted(years)
+        }
+        if year:
+            # if year is specified, return only that year
+            return info.get(str(year), {'citations': 0, 'self_cites': 0})
+        return info
 
 
-def get_thesis_kind(field):
-    if any(key in field.lower() for key in ['phd', 'ph.d.', 'doctor', 'dsc']):
-        return 'phd_thesis'
-    elif any(key in field.lower() for key in ['msc', 'm.sc.', 'master']):
-        return 'msc_thesis'
+class ObjectParser(object):
+    KEY_MAPS = {}
+    FIELDS = []
+
+    def __init__(self, entry):
+        self._entry = entry
+
+    def __getitem__(self, key):
+        if isinstance(key, str):
+            cleaner = f'get_{key}'
+            if hasattr(self, cleaner):
+                func = getattr(self, cleaner)
+                return func()
+            elif key in self.KEY_MAPS:
+                return self._entry.get(self.KEY_MAPS[key])
+            elif key in self._entry:
+                return self._entry.get(key)
+        else:
+            raise TypeError("Invalid argument type.")
+
+    def dict(self):
+        return {
+            field: self[field]
+            for field in self.FIELDS
+        }
+
+
+class PDBParser(ObjectParser):
+    """
+    Used to extract Deposition specific data suitable for storing in the database
+    from an RSCB API custom report entry
+
+    """
+    FIELDS = [
+        'code', 'title', 'authors', 'date', 'kind', 'pdb_doi'
+    ]
+    KEY_MAPS = {
+        'code': 'rcsb_id',
+        'title': 'struct.title',
+        'authors': 'rcsb_primary_citation.rcsb_authors',
+    }
+
+    def get_authors(self):
+        return self._entry.get('rcsb_primary_citation.rcsb_authors', [])
+
+    def get_date(self):
+        return parser.isoparse(self._entry['rcsb_accession_info.initial_release_date'])
+
+    def get_code(self):
+        return f"{self._entry['rcsb_id'].upper()}"
+
+    def get_kind(self):
+        return models.Publication.TYPES.pdb
+
+    def get_pdb_doi(self):
+        if self._entry.get('rcsb_primary_citation.pdbx_database_id_DOI'):
+            return self._entry['rcsb_primary_citation.pdbx_database_id_DOI']
+
+    def get_beamlines(self):
+        return [
+            PDB_SITE_MAP.get(key)
+            for key in self._entry['diffrn_source.pdbx_synchrotron_beamline'].split()
+        ]
+
+
+def fix_issns(issns: list) ->  list:
+    """
+    Fix issn formatting
+    :param issns: list of strings
+    :return: list of strings with issns formatted correctly
+    """
+
+    return [
+        re.sub(r'(\w{4})(?!$)', r'\1-', issn.replace('-', '').strip())
+        for issn in issns
+    ] or []
+
+
+class BookParser(ObjectParser):
+    """
+    Used to extract book specific data suitable for storing in the database
+    from a Google books API report entry
+
+    """
+    FIELDS = ['date', 'authors', 'code', 'abstract', 'kind', 'title', 'publisher']
+    BOOK_KIND = models.Publication.TYPES.book
+    KEY_MAPS = {
+        'abstract': 'description',
+    }
+
+    def get_code(self):
+        return f'{self._entry["industryIdentifiers"][0]["identifier"]}'
+
+    def get_date(self):
+        if len(self._entry['publishDate']) == 4:
+            d = dateparse.parse_date(f'{self._entry["publishDate"]}-01-01')
+        elif len(self._entry['publishDate']) == 7:
+            d = dateparse.parse_date(f'{self._entry["publishDate"]}-01')
+        else:
+            d = dateparse.parse_date(self._entry['publishDate'])
+        return d.isoformat()
+
+    def get_kind(self):
+        return self.BOOK_KIND
+
+    def get_authors(self):
+        return '; '.join(self._entry['authors'])
+
+    def get_title(self):
+        return '; '.join(
+            filter(None, [
+                self._entry['title'],
+                self._entry.get('subtitle', '')
+            ])
+        )
+
+
+class ArticleParser(ObjectParser):
+    """
+    Used to extra article specific data suitable for storing in the database
+    from a CrossRef report entry
+
+    """
+    KEY_MAPS = {
+        'topics': 'subject',
+        'pages': 'page',
+        'publisher': 'publisher',
+    }
+
+    FIELDS = [
+        'date', 'authors', 'code', 'kind', 'title', 'publisher', 'volume', 'issue', 'pages', 'journal',
+        'journal_metric', 'funders'
+    ]
+
+    # map crossref work types to PublicationTypes
+    TYPES_MAP = {
+        'reference-book': models.Publication.TYPES.book,
+        'proceedings-article': models.Publication.TYPES.proceeding,
+        'dissertation': models.Publication.TYPES.phd_thesis,
+        'edited-book': models.Publication.TYPES.book,
+        'journal-article': models.Publication.TYPES.article,
+        'report': models.Publication.TYPES.book,
+        'book-track': models.Publication.TYPES.book,
+        'standard': models.Publication.TYPES.book,
+        'book-section': models.Publication.TYPES.chapter,
+        'book-part': models.Publication.TYPES.chapter,
+        'book': models.Publication.TYPES.book,
+        'book-chapter': models.Publication.TYPES.chapter,
+        'monograph': models.Publication.TYPES.book,
+    }
+
+    def get_code(self):
+        return self._entry['DOI']
+
+    def get_date(self):
+        """
+        Generate a valid publish date, start with online, then hard and if not available,
+        use the created date.
+
+        :return: a date object
+        """
+        online = self._entry.get('published-online')
+        hard = self._entry.get('published-print')
+        created = self._entry.get('created')
+        if online:
+            parts = online['date-parts'][0]
+        elif hard:
+            parts = hard['date-parts'][0]
+        else:
+            parts = created['date-parts'][0]
+
+        parts = parts + [1] * (3 - len(parts))  # sometimes partial dates are given, assume first of month
+        return date(*parts)
+
+    def get_authors(self):
+        return [
+            f'{author["family"]}, {author.get("given", "")}'
+            for author in self._entry['author']
+        ]
+
+    def get_kind(self):
+        if self._entry['type'] == 'dissertation':
+            degree = '; '.join(self._entry.get('degree'))
+            if 'PhD' in degree or 'Doctor' in degree:
+                return models.Publication.TYPES.phd_thesis
+            elif 'MSc' in degree or 'Master' in degree:
+                return models.Publication.TYPES.msc_thesis
+            else:
+                return models.Publication.TYPES.phd_thesis
+        return self.TYPES_MAP.get(self._entry['type'], models.Publication.TYPES.magazine)
+
+    def get_title(self):
+        return '; '.join(self._entry['title'])
+
+    def get_funders(self):
+        return [
+            {
+                'name': funder['name'],
+                'doi': funder.get('DOI'),
+            }
+            for funder in self._entry.get('funder', [])
+        ]
+
+    @lru_cache(maxsize=128)
+    def get_journal(self):
+        issns = tuple(set(fix_issns(self._entry.get('ISSN', []))))
+        names = self._entry.get('short-container-title', [])
+        names += self._entry.get('container-title', [])
+        names.sort(key=lambda v: len(v))
+        names = list(filter(None, names))
+        issn_query = reduce(operator.__or__, [Q(codes__icontains=issn) | Q(issn__iexact=issn) for issn in issns], Q())
+        journal = models.Journal.objects.filter(issn_query).distinct().first()
+        if journal:
+            return journal.pk
+        elif issns:
+            return {
+                'title': '; '.join(self._entry.get('container-title', [])),
+                'codes': tuple(set(issns)),
+                'publisher': self._entry.get('publisher'),
+                'short_name': names[0]
+            }
+
+    def get_journal_metric(self):
+        journal = self.get_journal()
+        d = self.get_date()
+
+        if isinstance(journal, int):
+            return models.JournalMetric.objects.filter(journal=journal, year=d.year).order_by('-year').first()
+        return None
+
+    def get_main_title(self):
+        if self._entry['type'] in ['book-part', 'book-section', 'book-chapter']:
+            return '; '.join(self._entry['container-title'])
+
+    def get_isbn(self):
+        return self._entry.get('ISBN', [])
+
+    def get_affiliations(self):
+        return list({
+            inst['name']: {
+                'name': inst['name'],
+                'acronym': inst.get('acronym', ''),
+                'place': ', '.join(inst.get('place', [])),
+                'ror': inst.get('ROR', ''),
+            }
+            for auth in self._entry.get('author', [])
+            for inst in auth.get('affiliation', [])
+        }.values())
+
+
+class JournalParser(ObjectParser):
+    """
+    Used to extract journal specific data suitable for storing in the database
+    from a CrossRef report entry
+
+    """
+    KEY_MAPS = {
+        'publisher': 'publisher',
+    }
+
+    FIELDS = [
+        'title', 'codes', 'publisher',
+    ]
+
+    def get_codes(self):
+        return tuple(set(fix_issns(self._entry.get('ISSN', []))))
+
+    def get_topics(self):
+        return [topic['name'] for topic in self._entry.get('subjects', [])]
+
+    def get_asjc(self):
+        return list(filter(None, [topic.get('ASJC') for topic in self._entry.get('subjects', [])]))
+
+
+class SCIMagoParser(ObjectParser):
+    FIELDS = ['h_index', 'impact_factor', 'sjr_rank', 'sjr_quartile', 'codes']
+
+    @staticmethod
+    def make_float(text):
+        fixed_text = text.replace(',', '.')
+        try:
+            value = float(fixed_text)
+        except ValueError:
+            value = None
+        return value
+
+    def get_h_index(self):
+        return self.make_float(self._entry['H index'])
+
+    def get_impact_factor(self):
+        return self.make_float(self._entry['Cites / Doc. (2years)'])
+
+    def get_sjr_rank(self):
+        return self.make_float(self._entry['SJR'])
+
+    def get_sjr_quartile(self):
+        return {
+            'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4
+        }.get(self._entry['SJR Best Quartile'])
+
+    def get_codes(self):
+        return tuple({
+            re.sub(r'(\w{4})(?!$)', r'\1-', code.strip())
+            for code in self._entry['Issn'].split(',')
+        })
+
+
+def fetch_pdb_codes():
+    """
+    Retrieve all revised PDB Codes for the facility as a list of strings
+    """
+    dt = timezone.localtime(timezone.now() - timedelta(days=180))
+
+    query = (
+        (attrs.rcsb_accession_info.revision_date >= f"{dt:%Y-%m-%d}") &
+        (attrs.diffrn_source.pdbx_synchrotron_site == PDB_SITE)
+    )
+    try:
+        codes = list(query(return_type='entry'))
+    except Exception as e:
+        print(f"Error fetching PDB codes: {e}")
+        return []
+
+    return codes
+
+
+def fetch_pdb_entries(codes) -> list[dict]:
+    """
+    Fetch the CSV data for all specified PDB codes
+    :param codes:  list of strings representing pdbcodes
+    :return: a list of dictionaries one for each entry containing the report rows
+    """
+
+    params = REPORT_QUERY
+    params = params.format(', '.join([f'"{pdb}"' for pdb in codes]))
+
+    response = requests.post(PDB_REPORT_URL, json={'query': params})
+
+    if response.status_code == 200:
+        result = response.json()
+        return result['data']['entries']
     else:
-        return 'msc_thesis'
+        response.raise_for_status()
 
 
-def get_meta_key(key):
-    key = key.lower()
-    if key.startswith('dc.') or key.startswith('dcterms.'):
-        key = key.split('.', 1)[-1]
-    return key
+def create_pdb_entries(entries):
+    """
+    Create database entries for PDB results
+    :param entries: a list of dictionaries returned from PDB search reports
+    :return: a dictionary representing the numbers of entries created or updated
+    """
+    from beamlines.models import Facility
+
+    no_refs = models.Publication.objects.filter(
+        kind=models.Publication.TYPES.pdb, reference__isnull=True
+    ).distinct('code').in_bulk(field_name='code')
+
+    old_entries = models.Publication.objects.filter(kind=models.Publication.TYPES.pdb).values_list('code', flat=True)
+
+    new_entries = {}
+    updated_entries = []
+
+    entry_acronyms = defaultdict(list)  # a list of facility names for each pdb code
+
+    for entry in entries:
+        for i, src in enumerate(entry['diffrn_source']):
+            if src['pdbx_synchrotron_site'] == PDB_SITE:
+                break
+        for k in ['diffrn_source', 'diffrn_detector']:
+            entry[k] = entry.get(k) and entry.get(k, [])[i] or None
+        entry = flatten(entry)
+
+        record = PDBParser(entry)
+        info = record.dict()
+
+        if info['code'] in old_entries:
+            # Update citation parameter if citation has changed
+            if info['code'] in no_refs and record['reference'] and not no_refs[info['code']].pdb_doi:
+                no_refs[info['code']].pdb_doi = record['reference']
+                updated_entries.append(no_refs[info['code']])
+        else:
+            # New entries
+            entry_acronyms[info['code']].extend(record['beamlines'])
+            if not info['code'] in new_entries:  # entry will exist already for multi-beamline entries
+                new_entries[info['code']] = models.Publication(**info)
+
+    # update old entries if any changes have happened
+    if updated_entries:
+        models.Publication.objects.bulk_update(updated_entries, fields=['citation'])
+
+    # create new entries if any
+    if new_entries:
+        models.Publication.objects.bulk_create(new_entries.values())
+
+    # finally, add beamline relationships to newly created depositions:
+    target_entries = models.Publication.objects.filter(
+        code__in=entry_acronyms.keys()
+    ).distinct('code').in_bulk(field_name='code')
+    with transaction.atomic():
+        for code, deposition in target_entries.items():
+            deposition.beamlines.set(Facility.objects.filter(acronym__in=entry_acronyms[code]))
+    return {'created': len(new_entries), 'updated': len(updated_entries)}
 
 
-def extract_date(field):
+def fetch_book(isbn_list):
+    """
+    Given a list of book ISBN numbers, return metadata for the first entry
+    that successfully resolves using Google's Books API
+
+    :param isbn_list: list of ISBN numbers
+    :return: book parser
+    """
+
+    for isbn in isbn_list:
+        isbn = re.sub(r'[\s_-]', '', isbn)
+        params = {'q': f'isbn:{isbn}', 'key': GOOGLE_API_KEY}
+        response = requests.get(GOOGLE_BOOKS_API, params=params)
+        if response.status_code == requests.codes.ok:
+            result = response.json()
+            if result['totalItems'] == 0:
+                continue
+            record = BookParser(result['items'][0]['volumeInfo'])
+            return record.dict()
+    return {}
+
+
+def chunker(iterable, n):
+    """
+    Iterate through an iteratable in junks of at most n items
+    :param iterable: iterator
+    :param n: number of items in each chunk
+    :return: returns an iterable with n items
+    """
+
+    class Filler(object): pass
+
+    return (
+        itertools.filterfalse(lambda x: x is Filler, chunk)
+        for chunk in (itertools.zip_longest(*[iter(iterable)] * n, fillvalue=Filler))
+    )
+
+
+def create_publications(doi_list):
+    """
+    Given a list of dois, create database entries for the publications
+    :param doi_list:
+    :return: a dictionary representing the numbers of entries created
+    """
+
+    existing_pubs = set(models.Publication.objects.values_list('code', flat=True))
+    existing_journals = MultiKeyDict({
+        tuple(codes): pk
+        for codes, pk in models.Journal.objects.values_list('codes', 'pk')
+    })
+    # avoid fetching exising entries
+    pending_doi_list = list(set(doi_list) - existing_pubs)
+
+    if not pending_doi_list:
+        return {'journals': 0, 'publications': 0}
+
+    # fetch metadata from CrossRef
+    cr = CrossRef()
+    results = cr.works(ids=pending_doi_list)
+
+    # fix inconsistent JSON from works
+    results = results if isinstance(results, list) else [results]
+
+    new_publications = {}  # details of publications to create indexed by doi code
+    new_journals = MultiKeyDict({})  # journals to create
+
+    # first pass to create publication details
+    for item in results:
+        entry = ArticleParser(item['message'])
+        details = entry.dict()
+
+        if details['code'] in existing_pubs:
+            # publication exists already
+            continue
+
+        if details['kind'] == models.Publication.TYPES.chapter:
+            book_entry = fetch_book(entry['isbn'])
+            details['main_title'] = book_entry['title']
+            details['editor'] = book_entry['authors']
+            details['publisher'] = book_entry['publisher']
+        elif details['kind'] == models.Publication.TYPES.book:
+            book_entry = fetch_book(entry['isbn'])
+            details.update(book_entry.dict())
+        else:
+            journal = entry['journal']
+            if isinstance(journal, dict):
+                codes = journal['codes']
+                if codes in existing_journals:
+                    details['journal_id'] = existing_journals[codes]
+                else:
+                    # add journal details to new journals to create
+                    new_journals[codes] = journal
+
+                # keep issn for later use to swap for journal_id
+                details['journal_issn'] = codes
+            elif isinstance(journal, int):
+                # journal_id is already set, no need to create a new journal
+                details['journal_id'] = journal
+
+        new_publications[details['code']] = details
+
+    # Fetch new journal entries
+    for codes, journal in new_journals.items():
+        found = False
+        for code in codes:
+            try:
+                results = cr.journals(ids=code)
+                found = True
+            except requests.exceptions.HTTPError as e:
+                continue
+
+            # update journal details in new journals
+            entry = JournalParser(results['message'])
+            new_journals[codes].update(entry.dict())
+            break
+
+    # now ready to create journals
+    to_create = MultiKeyDict({
+        codes: models.Journal(**details) for codes, details in new_journals.items()
+        if codes
+    })
+
+    models.Journal.objects.bulk_create(to_create.values())
+
+    # update journal_ids
+    existing_journals = MultiKeyDict({
+        tuple(j.codes): j
+        for j in models.Journal.objects.all()
+    })
+
+    # update publication details
+    for details in new_publications.values():
+        if 'journal_issn' in details:
+            details['journal'] = existing_journals[details.pop('journal_issn')]
+        elif 'journal' in details and isinstance(details['journal'], int):
+            details['journal_id'] = details.pop('journal', None)
+
+    # create publication entries
+    if new_publications:
+        for details in new_publications.values():
+            beamlines = details.pop('beamlines', [])
+            funders = details.pop('funders', [])
+            obj = models.Publication.objects.create(**details)
+
+            if beamlines:
+                items = {bl for bl in beamlines if not bl.kind == bl.Types.sector}
+                for bl in [x for x in beamlines if (x.kind == x.Types.sector)]:
+                    items.update(bl.children.all())
+                obj.beamlines.add(*items)
+
+            if funders:
+                new_funders = []
+                for funder in funders:
+                    doi = funder.pop('doi', None)
+                    if not doi:
+                        continue
+                    f, created = models.FundingSource.objects.get_or_create(doi=doi, defaults=funder)
+                    new_funders.append(f)
+                obj.funders.add(*new_funders)
+
+    return {'journals': len(new_journals), 'publications': len(new_publications)}
+
+
+def update_pdb_references(pending: QuerySet) -> dict:
+    """
+    Update PDB depositions with references from CrossRef if available
+    :param pending: Queryset of pending depositions
+    :return: dictionary containing number of "pdbs" updated, and number of "references" added
+    """
+    now = timezone.now()
+
+    # Pending items are PDBs with pdb_doi but no reference
+    pending_depositions = defaultdict(list)
+
+    # multiple depositions can exist for the same DOI so group them together
+    for deposition in pending:
+        doi = re.sub(r'^https?://(dx\.)?doi\.org/', '', deposition.pdb_doi)
+        pending_depositions[doi].append(deposition)
+
+    # process doi in chunks of CROSSREF_BATCH_SIZE, to avoid issues with CrossRef rate limits
+    for chunk in chunker(pending_depositions.keys(), CROSSREF_BATCH_SIZE):
+        doi_list = list(chunk)
+        create_publications(doi_list)
+        time.sleep(CROSSREF_THROTTLE)
+
+    # Update references
+    added_references = models.Publication.objects.filter(
+        kind=models.Publication.TYPES.pdb, created__gt=now
+    ).distinct('code').in_bulk(
+        pending_depositions.keys(), field_name='code'
+    )
+
+    for code, depositions in pending_depositions.items():
+        for deposition in depositions:
+            deposition.reference = added_references.get(code)
+
+    models.Publication.objects.bulk_update(pending, fields=['reference'])
+
+    return {'references': len(pending_depositions), 'pdbs': len(pending)}
+
+
+def fetch_journal_metrics(year=None):
+    """
+    Fetch Journal Metrics for a given year from SJR
+    :param year: Year
+    :return: a dictionary containing metrics keyed by journal ISSN number
+    """
+
+    params = {
+        'out': 'xls',
+        'year': year if year else timezone.now().year
+    }
+    cache_dir = Path(settings.LOCAL_DIR) / 'cache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    file_path = cache_dir / f'scimago-{params["year"]}.pickle'
+    if os.path.exists(file_path):
+        with open(file_path, 'rb') as handle:
+            return pickle.load(handle)
+    else:
+        response = requests.get(SCIMAGO_URL, params=params)
+        if response.status_code == 200:
+            dialect = csv.Sniffer().sniff(response.text[:5000])
+            text = codecs.iterdecode(response.iter_lines(), 'utf-8')
+            reader = csv.DictReader(text, dialect=dialect)
+            results = {
+                obj.get_codes(): obj.dict()
+                for row in reader
+                for obj in [SCIMagoParser(row)]
+            }
+            with open(file_path, 'wb') as handle:
+                pickle.dump(results, handle)
+            return results
+
+
+def update_journal_metrics(year=None):
+    """
+    Fetch and create journal metrics profile for current year or a given year
+    :param year: Year or None
+    :return: Number of profiles created and deleted
+    """
+
+    # fetch metrics for the year
+    now = timezone.localtime(timezone.now())
+    yr = year if year else now.year
+    metrics_data = fetch_journal_metrics(yr)
+    if not metrics_data:
+        return {'created': 0, 'updated': 0}
+
+    metrics = MultiKeyDict(metrics_data)
+
+    # entries to be created
+    target_journals = models.Journal.objects.filter(articles__date__year__lte=yr)
+    to_create = [
+        models.JournalMetric(journal=journal, year=yr, **metrics[tuple(journal.codes)])
+        for journal in target_journals.exclude(metrics__year=yr).distinct()
+        if tuple(journal.codes) in metrics
+    ]
+    models.JournalMetric.objects.bulk_create(to_create)
+
+    # entries to update
+    to_update = models.JournalMetric.objects.filter(year=yr, journal__in=target_journals).distinct('journal')
+    num_updated = 0
+    for metric in to_update:
+        codes = tuple(metric.journal.codes)
+        if codes in metrics:
+            metric.h_index = metrics[codes]['h_index']
+            metric.impact_factor = metrics[codes]['impact_factor']
+            metric.sjr_rank = metrics[codes]['sjr_rank']
+            metric.sjr_quartile = metrics[codes]['sjr_quartile']
+            metric.modified = now
+            num_updated += 1
+    models.JournalMetric.objects.bulk_update(
+        to_update, fields=['h_index', 'impact_factor', 'sjr_rank', 'sjr_quartile', 'modified']
+    )
+    return {'created': len(to_create), 'updated': num_updated}
+
+
+def update_publication_metrics(rate_limit=10):
+    """
+    Fetch and create/or update publication metrics for current year or a given year
+
+    :param rate_limit: maximum number of requests per second
+    :return: number of entries created or deleted
+    """
+
+    # fetch metrics for the year
+    now = timezone.localtime(timezone.now())
+    cr = CrossRef()
+    oc = OpenCitations()
+
+    last_month = now - timedelta(weeks=4)
+    target_publications = models.Publication.objects.filter(code__regex=r'^10\.').filter(
+        Q(metrics__isnull=True) | Q(metrics__modified__lte=last_month)
+    )
+
+    publications = target_publications.distinct('code').in_bulk(field_name='code')
+
+    # Process at most CROSSREF_BATCH_SIZE publications at a time
+    doi_list = list(publications.keys())
+    to_create = []
+    update_count = 0
+    for doi in doi_list[:CROSSREF_BATCH_SIZE]:
+        pub = publications.get(doi)
+        citations = oc.citations(doi)
+        mentions = cr.mentions(doi)
+        to_update = models.ArticleMetric.objects.filter(publication=pub).distinct('year')
+        entries = {item.year: item for item in to_update}
+        for yr, count in mentions.items():
+            citations[yr] = citations.get(str(yr), {'citations': 0, 'self_cites': 0})
+            citations[yr]['mentions'] = count
+
+        for yr, info in citations.items():
+            if not yr:
+                continue
+
+            year = int(yr)
+            if year in entries:
+                metric = entries[year]
+                metric.citations = info['citations']
+                metric.self_cites = info['self_cites']
+                metric.mentions = info.get('mentions', 0)
+                metric.modified = now
+                update_count += 1
+            else:
+                to_create.append(models.ArticleMetric(publication=pub, year=year, **info))
+
+        # Update the publication modified date
+        models.ArticleMetric.objects.bulk_update(entries.values(), fields=['citations', 'self_cites', 'mentions', 'modified'])
+        time.sleep(1 / rate_limit)
+
+    # Create new metrics entries
+    if to_create:
+        models.ArticleMetric.objects.bulk_create(to_create)
+
+    return {'created': len(to_create), 'updated': update_count}
+
+
+def get_thesis_kind(field) -> models.Publication.TYPES:
+    """
+    Determine the kind of thesis based on keywords in the field.
+    :param field:
+    :return:
+    """
+    if any(key in field.lower() for key in ['phd', 'ph.d.', 'doctor', 'dsc']):
+        return models.Publication.TYPES.phd_thesis
+    else:
+        return models.Publication.TYPES.phd_thesis
+
+
+def extract_date(field) -> str:
+    """
+    Extract a date from a field using a regex pattern.
+    :param field: text
+    :return:
+    """
     date_pattern = re.compile(r'(\d{4}[-/]\d{2}[-/]\d{2})')
     match = date_pattern.search(field)
     if match:
         return match.group(1)
+    return ''
 
 
 SCHEMA_MAP = {
     'code': ('identifier', str),
     'title': ('name', str),
-    'authors': ('creator', join_creators),
-    'editor': ('contributor', join_names),
+    'authors': ('creator', lambda authors: [a['name'] for a in authors if 'name' in a]),
+    'editors': ('contributor', lambda editors: [e['name'] for e in editors if 'name' in e]),
     'kind': ('inSupportOf', get_thesis_kind),
-    'publisher': ('publisher', join_names),
+    'publisher': ('publisher', lambda names: '; '.join(a['name'] for a in names)),
     'date': ('temporal', extract_date),
+    'keywords': ('subject', list),
 }
-
 
 THESIS_META_MAP = {
     'code': ('identifier', str),
     'title': ('title', str),
     'authors': ('creator', lambda x: [x] if isinstance(x, str) else x),
-    'editor': ('contributor', join_strings),
     'kind': ('description', get_thesis_kind),
-    'publisher': ('publisher', join_strings),
-    'keywords': ('subject', join_strings),
+    'keywords': ('subject', list),
     'date': ('dateaccepted', extract_date),
 }
 
 
-def fetch_pdbs():
-    biosync_urls = {
-        f'https://biosync.sbkb.org/biosync_pdbtext/pdbtext{pdb_name}.txt': facilities
-        for pdb_name, facilities in USO_PDB_FACILITIES.items()
-    }
-    pdb_data = {}
-    for url, facilities in biosync_urls.items():
-        r = requests.get(url)
-        if r.status_code == requests.codes.ok:
-            csvfile = StringIO(r.text)
-            dialect = csv.Sniffer().sniff(csvfile.read(4024))
-            csvfile.seek(0)
-            reader = csv.DictReader(csvfile, dialect=dialect)
-            for row in reader:
-                if 'PDB_ID' in row:
-                    code = row['PDB_ID'].lower().strip()
-                    row['PDB_ID'] = code
-                    if code in pdb_data:
-                        pdb_data[code]['BEAMLINES'].extend(facilities)
-                    else:
-                        row['BEAMLINES'] = facilities
-                        pdb_data[code] = row
-                    add_pdb_entry(row)
+def get_meta_key(name: str) -> str:
+    """
+    Extract a metadata key from a meta tag name
+    :param name: The name of the meta tag
+    """
+    name = name.lower()
+    key = name
+    if name.startswith('dc.') or name.startswith('dcterms.'):
+        key = name.split('.', 1)[-1]
+    return key
 
 
-def add_pdb_entry(p):
-    from beamlines.models import Facility
-    from .models import PDBDeposition, Publication, Article
-
-    existing = PDBDeposition.objects.filter(code__iexact=p['PDB_ID'])
-    if existing.count():
-        create_new = False
-        b = existing[0]
-        if b.reference:
-            return
-    else:
-        create_new = True
-
-    info = get_raw_pdb_info(p['PDB_ID'])
-    doi = info.pop('reference')[0]
-    bls = [bl for bl in Facility.objects.filter(acronym__in=[k.upper() for k in p['BEAMLINES']])]
-    reference_id = None
-    if doi:
-        pubs = Article.objects.filter(code__icontains=doi)
-        if pubs.count() == 1:
-            reference_id = pubs[0].pk
-            pubs[0].beamlines.add(*bls)
-        else:
-            pub = auto_add_pub(doi, comment="Added automatically on {0}".format(date.today().isoformat()),
-                               beamlines=bls, affiliation=info['affiliation'])
-            reference_id = pub.pk
-    else:
-        pubs = Publication.objects.filter(title__icontains=info['title'].strip()[5:-5])
-        if pubs.count() == 1:
-            reference_id = pubs[0].pk
-        else:
-            info['notes'] = 'Could not find published article automatically'
-
-    info['reference_id'] = reference_id
-    if create_new:
-        b = PDBDeposition.objects.create(**info)
-    else:
-        b.reference_id = reference_id
-        b.save()
-    b.beamlines.add(*bls)
-
-
-def get_raw_pdb_info(code):
-    details = get_pdb_meta(code.lower())
-    doi, pmid = details.get('reference', ("", ""))
-    doi, pmid = doi.strip(), pmid.strip()
-    affiliation = {}
-
-    info = {
-        'reference': (doi, pmid),
-        'authors': details.pop('authors'),
-        'title': details.pop('title'),
-        'date': details.pop('date'),
-        'affiliation': affiliation,
-        'kind': 'pdb',
-        'code': code.lower(),
-        'category': 'beamline',
-        'keywords': details.pop('keywords'),
-        'history': ['Added from BioSync on {0}'.format(date.today().isoformat())],
-        'details': details,
-    }
-    return info
-
-
-def update_pdb_info(p):
-    from . import models
-    info = get_raw_pdb_info(p.code)
-    reference = info.pop('reference')
-    info['modified'] = timezone.localtime(timezone.now())
-    if reference:
-        ref_pub = models.Article.objects.filter(code=reference[0]).first()
-        if ref_pub:
-            info['reference'] = ref_pub
-    models.PDBDeposition.objects.filter(pk=p.pk).update(**info)
-    if p.reference and not p.reference.affiliation:
-        a = p.reference
-        a.affiliation = info['affiliation']
-        a.save()
-
-
-def auto_add_pub(doi, comment="", beamlines=[], affiliation=None):
-    from . import models
-    bs = models.Article.objects.filter(code__icontains=doi)
-    if bs.count():
-        return bs[0]
-    info = get_pub(doi)
-    if not info['affiliation']:
-        info['affiliation'] = affiliation
-    if comment:
-        info.update(history=[comment])
-    for issn in info.get('journal', {}).get('issn', '').split(';'):
-        js = models.Journal.objects.filter(issn__icontains=issn)
-        if js.count():
-            journal = js[0]
-            info['journal_id'] = journal.pk
-            break
-    if 'journal' in info and not 'journal_id' in info:
-        journal = models.Journal.objects.create(**info['journal'])
-        info['journal_id'] = journal.pk
-
-    info.pop('journal')
-    funders = info.pop('funders', [])
-    info.pop('unknown_funders', None)
-
-    if beamlines:
-        info['category'] = models.Publication.CATEGORIES.beamline
-    obj = models.Article.objects.create(**info)
-
-    if beamlines:
-        obj.beamlines.add(*beamlines)
-    if funders:
-        prep_funders = []
-        for f in funders:
-            fs = models.FundingSource.objects.filter(doi=f['doi'])
-            if fs.count():
-                prep_funders.append(fs[0])
-            else:
-                prep_funders.append(f)
-        funders = [f if isinstance(f, models.FundingSource) else models.FundingSource.objects.create(**f) for f in
-                   prep_funders]
-        obj.funders.add(*funders)
-
-    return obj
-
-
-def get_pdb_meta(pdbcode):
-    r = requests.get('https://www.rcsb.org/pdb/files/{0}.cif?headerOnly=YES'.format(pdbcode.upper()))
-    if r.status_code == requests.codes.ok:
-        data = r.text
-        loops = re.findall(r'\nloop_([^#]+)\n#', data, re.DOTALL | re.MULTILINE)
-        new_data = re.sub(r'(\nloop_[^#]+\n#)', '', data)
-        info = _flat_dict(new_data)
-        for loop in loops:
-            key, subinfo = _parse_loop(loop)
-            info[key] = subinfo
-
-        kwrds = info['struct_keywords'].get('text', '').split(', ') + info['struct_keywords'].get('pdbx_keywords',
-                                                                                                  '').split(', ')
-        kwrds = {v.lower().strip() for v in kwrds}
-        for k in ['pdbx_entity_nonpoly', 'citation_author', 'citation']:
-            if not k in info:
-                info[k] = []
-            if isinstance(info[k], dict):
-                info[k] = [info[k]]
-        if len(info['citation']):
-            reference = (info['citation'][0].get('pdbx_database_id_DOI', '').replace('?', ''),
-                         info['citation'][0].get('pdbx_database_id_PubMed', '').replace('?', ''))
-        else:
-            reference = ("", "")
-        details = {
-            'title': ". ".join(v['title'] for v in info['citation']),
-            'subtitle': info['struct']['title'],
-            'reference': reference,
-            'date': (
-                info['database_PDB_rev']['date']
-                if not isinstance(info['database_PDB_rev'], list)
-                else info['database_PDB_rev'][0]['date']
-            ),
-            'authors': [v['name'] for v in info.get('citation_author', [])],
-            'keywords': "; ".join(kwrds),
-            'description': info['struct'].get('pdbx_descriptor', ''),
-            'polymer': len(info['pdbx_poly_seq_scheme']),
-            'components': [v['name'].title() for v in info.get('pdbx_entity_nonpoly', [])],
-        }
-        return details
-
-
-def get_book(isbn):
-    if not isinstance(isbn, list):
-        isbns = [isbn]
-    else:
-        isbns = isbn
-
-    for isbn in isbns:
-        isbn = re.sub(r'[\s_-]', '', isbn)
-        url = f"https://www.googleapis.com/books/v1/volumes?q=isbn%3D{isbn}&key={GOOGLE_API_KEY}"
-        r = requests.get(url)
-        if r.status_code == requests.codes.ok:
-            record = r.json()
-            if record['totalItems'] == 0:
-                continue
-            record = record['items'][0]['volumeInfo']
-            _auth = []
-            isbn_list = [i.get('identifier', None) for i in record.get('industryIdentifiers', [{}]) if
-                         len(i.get('identifier', '')) == 13]
-            isbn = isbn_list[0] if len(isbn_list) > 0 else isbn
-            info = {
-                'authors': record.get('authors', []),
-                'code': isbn,
-                'title': (
-                    record['title']
-                    + ("" if not record.get('subtitle') else f": {record['subtitle']}")
-                ),
-                'publisher': record.get('publisher', ''),
-                'kind': 'chapter',
-                'date': '{0}-01-01'.format(record['publishedDate']) if len(
-                    record.get('publishedDate', '')) == 4 else record.get('publishedDate', ''),
-                'keywords': '; '.join(record.get('categories', [])),
-            }
-            if len(info['date']) == 7:
-                info['date'] = '{0}-01'.format(info['date'])
-
-            return info
-
-
-def get_patent(number):
-    number = number.replace(' ', '').upper()
-    url = f'https://patents.google.com/patent/{number}?key={GOOGLE_API_KEY}'
-    info = get_url_meta(url, extras={'itemprop':'priorArtKeywords'})
-
-    if info:
-        return {
-            'authors': info.get('contributor', []),
-            'title': info.get('title', '').strip(),
-            'date': info.get('date')[0] if isinstance(info.get('date'), list) else info.get('date', ''),
-            'kind': "patent",
-            'reviewed': False,
-            'keywords': '; '.join(info.get('priorArtKeywords', [])),
-            'category': None,
-            'number': number,
-        }
-
-
-def get_resource_meta(doi, resource="works", debug=False):
-    url = 'https://api.crossref.org/{1}/{0}'.format(doi, resource)
-    r = requests.get(url)
-
-    if r.status_code == requests.codes.ok:
-        record = r.json()
-        return record['message']
-
-
-TYPEDB = {
-    'j': 'journal',
-    'p': 'proceedings',
-    'd': 'magazine',
-    'k': 'bookseries',
-    'b': 'book',
-}
-
-WORKS_TYPES = {
-    'reference-book': 'chapter',
-    'proceedings-article': 'proceeding',
-    'dissertation': 'msc_thesis',
-    'edited-book': 'chapter',
-    'journal-article': 'article',
-    'report': 'chapter',
-    'book-track': 'chapter',
-    'standard': 'chapter',
-    'book-section': 'chapter',
-    'book-part': 'chapter',
-    'book': 'chapter',
-    'book-chapter': 'chapter',
-    'monograph': 'chapter',
-}
-
-
-def _prep_issn(issn_list):
-    return list(sorted([v.replace('-', '').strip() for v in issn_list]))
-
-
-def get_journal(issn):
-    if isinstance(issn, list):
-        issns = issn
-    else:
-        issns = [issn]
-    jinfo = {'issn': _prep_issn(issns), 'sjr': 0, 'hindex': 0, 'ifactor': 0}
-    for code in issns:
-        r = requests.get('https://api.crossref.org/journals/{0}-{1}'.format(code[:4], code[-4:]))
-        if r.status_code == requests.codes.ok:
-            record = r.json()
-            jinfo.update({
-                'issn': _prep_issn(record['message']['ISSN']),
-                'title': record['message']['title'],
-                'publisher': record['message']['publisher']})
-            break
-
-    for code in jinfo['issn']:
-        if code in SJRDB:
-            jinfo.update({
-                'sjr': SJRDB[code]['SJR'],
-                'ifactor': SJRDB[code]['Cites / Doc. (2years)'] if jinfo['ifactor'] == 0 else jinfo['ifactor'],
-                'hindex': int(SJRDB[code]['H index']),
-                'score_date': date.today()})
-            jinfo['kind'] = TYPEDB.get(SJRDB[code]['Type'])
-            jinfo['issn'] = jinfo['issn'] + [SJRDB[code]['ISSN']]
-            if not 'title' in jinfo:
-                jinfo.update(title=SJRDB[code]['Title'])
-
-        if code in IFDB:
-            jinfo.update({'ifactor': IFDB[code][sorted(IFDB[code].keys())[-4]]})
-        if 'score_date' in jinfo:
-            break
-
-    if not 'title' in jinfo:
-        url = 'https://xissn.worldcat.org/webservices/xid/issn/{0}-{1}'.format(issn[:4], issn[-4:])
-        params = {'method': 'getMetadata', 'format': 'json'}
-        r = requests.get(url, params=params)
-        if r.status_code == requests.codes.ok:
-            record = r.json()
-            try:
-                record = record['group'][0]['list'][0]
-                jinfo.update({
-                    'issn': [record['issn'].replace('-', '')],
-                    'title': record['title'],
-                    'publisher': record['publisher']})
-            except:
-                pass
-    if 'issn' in jinfo:
-        jinfo['issn'] = ';'.join(sorted(set([v for v in jinfo['issn'] if v])))
-        return jinfo
-
-
-def get_sjr_issn(issn):
-    url = 'https://www.scimagojr.com/journalsearch.php?q={0}&tip=issn'.format(issn)
-    text = subprocess.check_output(['links', "-width", "512", "-dump", url])
-    issns = re.findall(r'ISSN:\s+((?:[\dA-Z]{8},? ?)*)', text)
-    return [i.strip() for i in issns[0].split(',')]
-
-
-def get_citedby(doi, user='michel.fodje@lightsource.ca'):
-    url = 'https://www.crossref.org/openurl/'
-    params = {
-        'pid': user,
-        'id': 'doi:{0}'.format(doi),
-        'noredirect': 'true'
-    }
-    r = requests.get(url, params=params)
-    if r.status_code == requests.codes.ok:
-        try:
-            root = etree.parse(BytesIO(r.content)).getroot()
-            query = root[0][1][0]
-            count = int(query.get('fl_count'))
-            # print 'Citations found for doi', doi, u'[#{0}]'.format(count)
-            return count
-        except:
-            # print u'ERROR fetching citations for doi', doi
-            return 0
-    else:
-        # print u'ERROR fetching citations for doi', doi, u'CODE [{0}]'.format(requests.codes.ok)
-        return 0
-
-
-def _load_if():
-    pgs = ['0-A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U',
-           'V', 'W', 'X', 'Y', 'Z']
-    fname = os.path.join(os.path.dirname(__file__), "testing", "IF-DATA", "journal-impact-factor-list-2014_{0}.html")
-    headers = ['index', 'title', 'issn', '2014', '2012', '2011', '2010', '2009', '2008']
-    ftypes = ['2014', '2012', '2011', '2010', '2009', '2008']
-    IF_DB = {}
-    for pg in pgs:
-        with open(fname.format(pg), 'rb') as fobj:
-            root = etree.parse(fobj, etree.HTMLParser())
-            data = root.xpath('/html/body/div[2]/div/div[2]/div/div[2]/table//tr')
-            for jn in data:
-                values = [el.text for el in jn.xpath('td')]
-                if not any(values): continue
-                jndict = dict(list(zip(headers, values)))
-                for k in ftypes:
-                    if jndict[k] not in ['-', '', None]:
-                        jndict[k] = float(jndict[k].strip())
-                    else:
-                        jndict[k] = 0.0
-                jnkey = jndict['issn'].replace('-', '').strip()
-                IF_DB[jnkey] = jndict
-    with open('impact-factors.json', 'w') as outf:
-        json.dump(IF_DB, outf, indent=4)
-
-    return IF_DB
-
-
-def _fetch_sjr(year):
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_10_1) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/39.0.2171.95 Safari/537.36'
-    }
-    url = f'https://www.scimagojr.com/journalrank.php?category=0&area=0&year={year}&country=&order=sjr&page=0&min=0&min_type=cd&out=xls'
-    return requests.get(url)
-
-
-def _parse_sjr(r):
-    import xlrd
-    book = xlrd.open_workbook(file_contents=r.content)
-    sheet = book.sheet_by_index(0)
-    headers = dict((i, sheet.cell_value(0, i)) for i in range(sheet.ncols))
-    raw = (dict((headers[j], sheet.cell_value(i, j)) for j in headers) for i in range(1, sheet.nrows))
-    data = {}
-    for row in raw:
-        if row.get('ISSN'):
-            k = row['ISSN'].split()[-1]
-            row['ISSN'] = k
-            data[k] = row
-        else:
-            k = row['Title']
-            data[k] = row
-    return data
-
-
-def get_sjr(year):
-    r = _fetch_sjr(year)
-    return _parse_sjr(r)
-
-
-def load_csv(fname, pub_type=None):
-    with open(fname, 'rb') as csvfile:
-        dialect = csv.Sniffer().sniff(csvfile.read(4024))
-        csvfile.seek(0)
-        reader = csv.DictReader(csvfile, dialect=dialect)
-        if not pub_type:
-            data = [row for row in reader]
-        else:
-            data = [row for row in reader if row['Publication_Type'] == pub_type]
-    return data
-
-
-def search_pub(title, debug=False):
-    url = 'https://search.crossref.org/dois?q={0}&rows=10&sort=score'.format(title)
+def get_url_meta(url, extras=None) -> dict:
+    """
+    Get metadata from a URL
+    :param url: The URL to fetch
+    :param extras: additional properties to fetch name, value keyword pairs
+    """
+    extras = {} if not extras else extras
     r = requests.get(url)
     if r.status_code == requests.codes.ok:
-        record = r.json()[0]
-        record['doi'] = record['doi'].replace('https://dx.doi.org/', '')
-        record.pop('coins')
-        return record
+        root = etree.parse(BytesIO(r.content), etree.HTMLParser())
+        raw_info = [
+                       (get_meta_key(el.get('name', 'junk')), el.get('content'))
+                       for el in root.xpath('//meta')
+                   ] + [
+                       (value, el.text)
+                       for prop, value in extras.items()
+                       for el in root.xpath(f"//*[@{prop}='{value}']")
+                   ]
+        schema_info = defaultdict(list)
+        for k, v in raw_info:
+            schema_info[k].append(v)
+        schema_info = {k: (v[0] if len(v) == 1 else v) for k, v in schema_info.items()}
+        return schema_info
+
+    return {}
 
 
-def enw(data):
-    raw = defaultdict(list)
-    for k, v in re.findall(r'%(\w)\s(.+)\n', data):
-        raw[k].append(re.sub(r'\u2010', r'-', v.strip()))
-    nraw = {k: (v[0] if len(v) == 1 else '; '.join(v)) for k, v in list(raw.items())}
-    return nraw
-
-
-def enw2json(data):
-    raw = defaultdict(list)
-    data = re.sub(r'(%\w\s)', r'\n\1', re.sub(r'\n\s+', r' ', data))
-    for k, v in re.findall(r'%(\w)\s(.+)\n', data):
-        raw[k].append(re.sub('\u2010', r'-', v.strip()))
-    nraw = {k: (v[0] if len(v) == 1 else '; '.join(v)) for k, v in list(raw.items())}
-    info = {
-        'DOI': nraw.get('R', '').replace('doi:https://dx.doi.org/', ''),
-        'author': [{'family': k.split(', ')[0], 'given': k.split(', ')[1]} for k in raw['A']],
-        'title': nraw.get('T', ''),
-        'container-title': [nraw.get('J', '')],
-        'volume': nraw['V'],
-        'issue': nraw.get('N'),
-        'page': nraw['P'],
-        'subject': raw['K'],
-        'issued': {'date-parts': [nraw['D'].split('-')]},
-        'type': '-'.join(nraw.get('0', '').lower().split()),
-        'publisher': 'AIP'
-    }
-    return info
-
-
-def get_aip(doi):
-    r = requests.get('https://scitation.aip.org/content/aip/proceeding/aipcp/{0}/cite/endnote'.format(doi))
-    try:
-        info = enw2json(f"{r.text}")
-        return info
-    except:
-        return {}
-
-
-def get_doi_meta(doi):
-    url = doi if doi.startswith('http') else f'https://dx.doi.org/{doi}'
-    return get_url_meta(url)
-
-
-def get_schema_meta(url):
+def get_schema_meta(url: str) -> dict:
+    """
+    Fetch metadata from a URL using schema.org JSON-LD format
+    :param url: url to fetch
+    """
     r = requests.get(url)
     if r.status_code == requests.codes.ok:
         root = etree.parse(BytesIO(r.content), etree.HTMLParser())
@@ -595,214 +1069,93 @@ def get_schema_meta(url):
     return {}
 
 
-def get_url_meta(url, extras=None):
+def get_thesis_meta(url: str) -> dict:
     """
-    Get metadata from a URL
-    :param url: The URL to fetch
-    :param extras: additional properties to fetch name, value keyword pairs
-    :return:
+    Fetch thesis metadata from a URL using meta tags
+    :param url: url to fetch
     """
-    extras = {} if not extras else extras
-    r = requests.get(url)
-    if r.status_code == requests.codes.ok:
-        root = etree.parse(BytesIO(r.content), etree.HTMLParser())
-        raw_info = [
-            (get_meta_key(el.get('name', 'junk')), el.get('content'))
-            for el in root.xpath('//meta')
-        ] + [
-            (value, el.text)
-            for prop, value in extras.items()
-            for el in root.xpath(f"//*[@{prop}='{value}']")
-        ]
-        schema_info = defaultdict(list)
-        for k, v in raw_info:
-            schema_info[k].append(v)
-        schema_info = {k: (v[0] if len(v) == 1 else v) for k, v in schema_info.items()}
-        return schema_info
-
-
-def get_thesis_meta(uri):
-    schema_info = get_url_meta(uri)
-    if schema_info:
+    info = get_url_meta(url)
+    if info:
         pub_info = {
-            field: converter(schema_info[k])
+            field: converter(info[k])
             for field, (k, converter) in THESIS_META_MAP.items()
-            if k in schema_info
+            if k in info
         }
         return pub_info
     return {}
 
 
-SUPPORTED_THESIS_METHODS = [get_schema_meta, get_thesis_meta]
+class Fetcher:
+    """
+    A class is a collection of class methods to fetch various publication related data.
+    """
 
+    @staticmethod
+    def get_pdb():
+        raise NotImplementedError("Subclasses should implement this method.")
 
-def get_thesis(url):
-    for method in SUPPORTED_THESIS_METHODS:
-        info = method(url)
-        if info:
-            return info
+    @staticmethod
+    def get_doi(doi: str) -> dict:
+        """
+        Fetch publication metadata from CrossRef using a DOI.
+        :param doi: Digital Object Identifier.
+        """
+        cr = CrossRef()
+        results = cr.works(ids=[doi])
 
+        # fix inconsistent json from works
+        results = results if isinstance(results, list) else [results]
 
-def get_pub(doi, debug=False):
-    if not doi:
-        return
+        # first pass to create publication details
+        for item in results:
+            record = ArticleParser(item['message'])
+            entry = record.dict()
+            return entry
+        return {}
 
-    url = f'https://api.crossref.org/works/{doi}'
-    r = requests.get(url)
-    good = (r.status_code == requests.codes.ok)
-    if not good and re.match(r'10.1063/\d\.\d+', doi):
-        record = get_aip(doi)
-        if record:
-            good = True
-    else:
-        record = r.json()['message']
-
-    if good:
-        try:
-            date_parts = list(map(int, record['issued']['date-parts'][0] + [1, 1, 1]))
-        except:
-            date_parts = list(map(int, record['deposited']['date-parts'][0] + [1, 1, 1]))
-        if not record['container-title'] and re.match(r'10.1063/\d\.\d+', doi):
-            record.update(get_aip(doi))
-
-        # prepare affiliation
-        affiliations = defaultdict(list)
-        for author in record.get('author', []):
-            author_name = ', '.join([author['family'], author.get('given', '')])
-            if 'affiliation' in author:
-                for affil in author['affiliation']:
-                    if 'id' in affil:
-                        a_entry = affil['id']
-                        if isinstance(a_entry, list) and len(a_entry) > 0:
-                            key = a_entry[0]['id']
-                            affiliations[key].append(author_name)
-
-        pub_dict = {
-            'authors': [n['family'] + ', ' + n.get('given', '') for n in record.get('author', [])],
-            'affiliation': dict(affiliations),
-            'title': ': '.join([t.strip() for t in record['title']]) if isinstance(record['title'], list) else record[
-                'title'].strip(),
-            'keywords': re.sub(r'\(([^()]+)\)', r'', '; '.join(record.get('subject', []))),
-            'kind': WORKS_TYPES[record['type']],
-            'reviewed': False,
-            'volume': record.get('volume'),
-            'number': record.get('issue'),
-            'pages': record.get('page'),
-            'code': record['DOI'],
-            'date': date(*date_parts[:3]).isoformat(),
-        }
-
-        if 'funder' in record:
-            pub_dict['funders'] = [get_funder(v['DOI']) for v in record['funder'] if v.get('DOI')]
-            pub_dict['unknown_funders'] = [{'name': v['name']} for v in record['funder'] if not v.get('DOI')]
-
-        if record.get('ISSN'):
-            issn = record.get('ISSN')[0] if isinstance(record.get('ISSN')[0], list) else record.get('ISSN')
-            issn = _prep_issn(issn)
-            pub_dict['journal'] = get_journal(issn)
-            pub_dict['kind'] = 'proceeding' if WORKS_TYPES[record['type']] == 'proceeding' else 'article'
-        elif record.get('ISBN'):
-            isbns = [v.split('/')[-1] for v in record['ISBN']]
-            pub_dict['book'] = get_book(isbns)
-            pub_dict['kind'] = 'proceeding' if WORKS_TYPES[record['type']] == 'proceeding' else 'chapter'
-        else:
-            if record.get('container-title'):
-                pub_dict['book'] = {
-                    'title': record['container-title'][0] if isinstance(record['container-title'], list) else record[
-                        'container-title'].strip(),
-                    'kind': 'book',
+    @staticmethod
+    def get_thesis(url: str) -> dict:
+        """
+        Fetch thesis metadata from a URL returns results of the first successful method
+        :param url: url to fetch
+        """
+        for method in [get_schema_meta, get_thesis_meta]:
+            info = method(url)
+            if info:
+                return {
+                    'authors': info.get('authors', []),
+                    'title': info.get('title', '').strip(),
+                    'date': info.get('date', ''),
+                    'kind': info.get('kind', models.Publication.TYPES.phd_thesis),
+                    'keywords': info.get('keywords', []),
+                    'code': info.get('code', url),
+                    'editors': info.get('editors', []),
+                    'publisher': info.get('publisher', ''),
                 }
-        pub_dict['title'] = re.sub(r'\$_?{?(?:\\bf)\s*([^$]*)}\$', r'\1', pub_dict['title'])
-        return pub_dict
+        return {}
 
+    @staticmethod
+    def get_patent(number: str) -> dict:
+        number = number.replace(' ', '').upper()
+        url = f'https://patents.google.com/patent/{number}'
+        info = get_url_meta(url, extras={'itemprop': 'priorArtKeywords'})
 
-def get_funder(doi):
-    record = get_resource_meta(doi, resource="funders")
-    if record:
-        return {
-            'name': record['name'],
-            'location': record['location'],
-            'doi': '10.13039/{0}'.format(record['id']),
-            'acronym': min((record['alt-names'] + [record['name']]), key=len),
-        }
+        if info:
+            return {
+                'authors': info.get('contributor', []),
+                'title': info.get('title', '').strip(),
+                'date': info.get('date')[0] if isinstance(info.get('date'), list) else info.get('date', ''),
+                'kind': models.Publication.TYPES.patent,
+                'keywords': info.get('priorArtKeywords', []),
+                'code': number,
+            }
+        return {}
 
-
-class DotExpandedDict(dict):
-    """
-    A special dictionary constructor that takes a dictionary in which the keys
-    may contain dots to specify inner dictionaries. It's confusing, but this
-    example should make sense.
-
-    >>> d = DotExpandedDict({'person.1.firstname': ['Simon'], \
-    'person.1.lastname': ['Willison'], \
-    'person.2.firstname': ['Adrian'], \
-    'person.2.lastname': ['Holovaty']})
-    >>> d
-    {'person': {'1': {'lastname': ['Willison'], 'firstname': ['Simon']}, '2': {'lastname': ['Holovaty'], 'firstname': ['Adrian']}}}
-    >>> d['person']
-    {'1': {'lastname': ['Willison'], 'firstname': ['Simon']}, '2': {'lastname': ['Holovaty'], 'firstname': ['Adrian']}}
-    >>> d['person']['1']
-    {'lastname': ['Willison'], 'firstname': ['Simon']}
-
-    # Gotcha: Results are unpredictable if the dots are "uneven":
-    >>> DotExpandedDict({'c.1': 2, 'c.2': 3, 'c': 1})
-    {'c': 1}
-    """
-
-    def __init__(self, key_to_list_mapping):
-        super().__init__()
-        for k, v in list(key_to_list_mapping.items()):
-            current = self
-            bits = k.split('.')
-            for bit in bits[:-1]:
-                current = current.setdefault(bit, {})
-            # Now assign value to current position
-            try:
-                current[bits[-1]] = v
-            except TypeError:  # Special-case if current isn't a dict.
-                current = {bits[-1]: v}
-
-
-def _flat_dict(text):
-    m = re.findall(rf'^_([\w\.]+)[\s\n]+([^_#]+)', text, re.DOTALL | re.MULTILINE)
-    d = dict([(v[0], re.sub(r"'(.*)'", r'\1', re.sub(r'(^;?)|(\n;?)', ' ', v[1], re.MULTILINE).strip())) for v in m])
-    return DotExpandedDict(d)
-    # return d
-
-
-def _parse_loop(text):
-    keys = re.findall(r'\n_([\w\.]+)', text)
-    prefix = os.path.commonprefix(keys)
-    ikeys = [v.split(prefix)[-1] for v in keys]
-
-    text = re.sub(r'\n(_[\w\.]+)', '', text)
-    vre = r"((?:[^\s\']+)|(?:'[^\'\n]+'))\s+"
-    patt = r"^" + vre * len(keys) + r"$"
-    vals = re.findall(patt, text, re.DOTALL | re.MULTILINE)
-    return prefix[:-1], [dict(list(zip(ikeys, [re.sub(r"'(.*)'", r'\1', item.strip()) for item in val]))) for val in vals]
-
-
-# Find and load publication metrics
-DB_FILES = {}
-SJRDB = {}
-IFDB = {}
-
-
-def load_metrics():
-    global SJRDB, IFDB
-    for db in ['sjr', 'impact-factors']:
-        path = os.path.join(settings.LOCAL_DIR, 'metrics')
-        db_file = os.path.join(path, f'{db}.json')
-        if os.path.exists(db_file):
-            DB_FILES[db] = db_file
-            break
-    if 'sjr' in DB_FILES:
-        with open(DB_FILES['sjr'], 'r') as f:
-            SJRDB = json.load(f)
-    if 'impact-factors' in DB_FILES:
-        with open(DB_FILES['impact-factors'], 'r') as f:
-            IFDB = json.load(f)
-
-
-# load publication metrics
-load_metrics()
+    @staticmethod
+    def get_book(isbn: str) -> dict:
+        """
+        Fetch book information by ISBN.
+        :param isbn: ISBN number of the book.
+        :return: BookParser object with book details.
+        """
+        return fetch_book([isbn])

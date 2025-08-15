@@ -18,7 +18,7 @@ import os
 
 DEBUG = False                        # Set to False in production
 SITE_URL = "http://localhost:8080"  # The URL of the site
-ALLOWED_HOSTS = ["localhost", '*']  # The list of allowed hosts
+ALLOWED_HOSTS = ['localhost', '*', 'proxy']  # The list of allowed hosts
 
 # -----------------------------------------------------------------------------
 # SECRET_KEY is a crucial security setting used for cryptographic signing within
@@ -118,15 +118,22 @@ DATABASES = {
 # -----------------------------------------------------------------------------
 # USO_PROFILE_MANAGER = PeopleDBProfileManager
 # -----------------------------------------------------------------------------
-# Configure Facilities for fetching PDB entries
+# Configure CROSSREF and Protein Data Bank Settings
+
+CROSSREF_THROTTLE = 1   # time delay between crossref calls
+CROSSREF_BATCH_SIZE = 20
+CROSSREF_API_EMAIL = os.getenv('CROSSREF_API_EMAIL')
+OPEN_CITATIONS_API_KEY = os.getenv('OPEN_CITATIONS_API_KEY')  # OpenCitations API key for citation data
+
 # The key is the PDB ID in the format {SITE}{BEAMLINE}.  The value is a list of local facility acronyms to credit for
 # each PDB entry in that category. For example:
-# USO_PDB_FACILITIES = {
+
+USO_PDB_SITE = 'CLSI'       # Protein Data Bank site code
+# USO_PDB_SITE_MAP = {
 #     "CLSI08B1-1": ["CMCF-ID"],
 #     "CLSI08ID-1": ["CMCF-BM"],
 #     "CLSIUNKNOWN": ["CMCF-ID", "CMCF-BM"],
 # }
-
 # -----------------------------------------------------------------------------
 # Override code generators for Projects, Proposals, Submissions, and Materials
 # These are the default code generators, you can override any or all of them:

@@ -336,8 +336,10 @@ class SubmitProposal(RolePermsViewMixin, ModalUpdateView):
         # Select available tracks based on requested techniques and call status
         if cycle.is_closed():
             valid_tracks = models.ReviewTrack.objects.filter(require_call=False)
-        else:
+        elif cycle.is_open():
             valid_tracks = models.ReviewTrack.objects.filter(require_call=True)
+        else:
+            valid_tracks = models.ReviewTrack.objects.none()
 
         available_tracks = set(valid_tracks.values_list('pk', flat=True))
         requests = {
@@ -1244,7 +1246,7 @@ class UserSubmissionList(SubmissionList):
 
 class CycleSubmissionList(SubmissionList):
     def get_queryset(self, *args, **kwargs):
-        self.queryset = self.model.objects.filter(cycle_id=self.kwargs['pk'])
+        self.queryset = self.model.objects.filter(cycle_id=self.kwargs['cycle'])
         return super().get_queryset(*args, **kwargs)
 
 
@@ -1807,22 +1809,6 @@ class StartReviews(RolePermsViewMixin, ModalConfirmView):
                 description=f'Cycle {cycle}: Reviews for {stage.track} stage-{stage.position} started'
             )
         return JsonResponse({"url": ""})
-
-
-class StatsDataAPI(RolePermsViewMixin, TemplateView):
-    admin_roles = USO_ADMIN_ROLES
-    allowed_roles = USO_STAFF_ROLES
-
-    def get(self, *args, **kwargs):
-        from . import stats
-        tables = stats.get_proposal_stats()
-        return JsonResponse(tables[1].series())
-
-
-class Statistics(RolePermsViewMixin, TemplateView):
-    admin_roles = USO_ADMIN_ROLES
-    allowed_roles = USO_STAFF_ROLES
-    template_name = "proposals/statistics.html"
 
 
 class UpdateReviewComments(RolePermsViewMixin, ModalUpdateView):

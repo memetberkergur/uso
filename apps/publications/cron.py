@@ -1,97 +1,141 @@
+
+from django.db.models import QuerySet, Q, Value, IntegerField, F, Max, Min
+from django.contrib.postgres.aggregates import ArrayAgg
+from django.db.models.functions import Cast
+
 from isocron import BaseCronJob
-from datetime import date
-import time
 from . import utils
-import os
-from django.conf import settings
-import json
 
 
-class FetchBiosync(BaseCronJob):
+class FetchPDBEntries(BaseCronJob):
     """
-    Fetch the latest biosync data from the PDB and update the local database.
+    Fetch the latest Deposition data from the PDB and update the local database.
     """
-    run_every = "P7D"
+    run_every = "P10D"
+    pdb_codes: list[str] = []
+
+    def is_ready(self):
+        self.pdb_codes = utils.fetch_pdb_codes()
+        return len(self.pdb_codes) > 0
 
     def do(self):
-        utils.fetch_pdbs()
+        # create PDB depositions
+        entries = utils.fetch_pdb_entries(self.pdb_codes)
+        out = utils.create_pdb_entries(entries)
+        logs = [
+            f'Fetched {out["created"]} new PDB entries",'
+            f'Updated {out["updated"]} existing entries.'
+        ]
+        return '\n'.join(logs)
 
 
-class FetchCitations(BaseCronJob):
+class UpdatePDBReferences(BaseCronJob):
+    """
+    Fetch the latest CrossRef data for PDB entries
+    """
+    run_every = "P5D"
+
+    pending: QuerySet
+
+    def is_ready(self):
+        from .models import Publication
+        self.pending = Publication.objects.filter(
+            kind=Publication.TYPES.pdb, pdb_doi__isnull=False, reference__isnull=True
+        )
+
+        return self.pending.exists()
+
+    def do(self):
+        out = utils.update_pdb_references(self.pending)
+        return f"Added {out['references']} references to {out['pdbs']} PDB entries"
+
+
+class UpdateArticleMetrics(BaseCronJob):
     """
     Fetch the latest citation counts for articles published in the current month.
     """
-    run_every = "P1M"
-
-    def do(self):
-        from publications import models
-        out = ""
-        for a in models.Article.objects.filter(date__month=date.today().month):
-            cite_count = utils.get_citedby(a.code)
-            if cite_count > 0 and cite_count != a.citations:
-                out += 'Updated citation count for {0}: {1}\n'.format(a.code, cite_count)
-                a.citations = cite_count
-                a.history.append('Citation count updated on {0}'.format(date.today().isoformat()))
-                a.save()
-            time.sleep(0.1)
-        return out
-
-
-class UpdatePublications(BaseCronJob):
-    """
-    Update the meta-data for all articles published in the current month.
-    """
     run_every = "P7D"
 
     def do(self):
-        from publications import models
-        out = ""
-        for a in models.Article.objects.filter(date__gte=date.today()):
-            info = utils.get_pub(a.code)
-            models.Article.objects.filter(pk=a.pk).update(
-                authors=info['authors'],
-                title=info['title'],
-                keywords=info['keywords'],
-                volume=info['volume'],
-                number=info['number'],
-                date=info['date'])
-            out += f'Updated meta-data for {a.code}'
-            time.sleep(0.1)
-        return out
+        # FIXME: some older metrics may be missed if article was published before the last run
+        # but only added recently
+        from publications import utils
+        out = utils.update_publication_metrics()
+        logs = [
+            f'Updated {out["updated"]} article metrics.',
+            f'Created {out["created"]} new metrics for articles.'
+        ]
+        return '\n'.join(logs)
 
 
-class UpdateMetrics(BaseCronJob):
+class UpdateJournalMetrics(BaseCronJob):
     """
     Update the SJR metrics for journals based on the latest SJR database.
     """
     run_every = "P3M"
+    missing_years: list[int]
+
+    def is_ready(self):
+        from publications import models
+        spans = models.Journal.objects.aggregate(
+            article_years=ArrayAgg(
+                Cast('articles__date__year', output_field=IntegerField()),
+                filter=Q(articles__date__year__isnull=False),
+                distinct=True,
+                default=Value([])
+            ),
+            metrics_years=ArrayAgg(
+                Cast('metrics__year', output_field=IntegerField()),
+                filter=Q(metrics__year__isnull=False),
+                distinct=True,
+                default=Value([])
+            ),
+        )
+        article_years = spans['article_years']
+        if not article_years:
+            # no articles, no metrics to update
+            self.missing_years = []
+            return False
+
+        min_year = min(article_years)
+        max_year = max(article_years)
+        all_years = set(range(min_year, max_year + 1))
+        metrics_years = set(spans['metrics_years'])
+        self.missing_years = list(sorted(all_years - metrics_years))
+        return len(self.missing_years) > 0
 
     def do(self):
-        from publications import models
-        out = ""
-        last_year = date.today().year - 1
-        sjrdb_list = list(utils.SJRDB.values())
+        from publications import utils, models
+        logs = []
 
-        if not sjrdb_list and f'Total Docs. ({last_year})' in sjrdb_list[0]:
-            return "SJR database is up-to-date on {0}".format(date.today())
+        # Update the journal metrics for the missing years
+        for year in self.missing_years:
+            out = utils.update_journal_metrics(year=year)
+            logs.extend([
+                f'Created {out["created"]} new journal metrics for year {year}.',
+                f'Updated {out["updated"]} existing journal metrics for year {year}.'
+            ])
 
-        sjrdb = utils.get_sjr(last_year)
-        if sjrdb:
-            metrics_dir = os.path.join(settings.LOCAL_DIR, 'metrics')
-            os.makedirs(metrics_dir, exist_ok=True)
-            with open(os.path.join(settings.LOCAL_DIR, 'metrics', 'sjr.json'), 'w') as fobj:
-                json.dump(sjrdb, fobj)
+        # link articles to their journal metrics, that is the journal metric for the year of publication or
+        # the nearest one in time if no metrics are available for that year
+        pub_journal_metrics = models.Publication.objects.exclude(
+            journal_metric__year=F('date__year')        # if journal metric for year is assigned, ignore it
+        ).values(
+            'pk',
+            prev_metric=Max('journal__metrics__pk', filter=Q(journal__metrics__year__lte=F('date__year'))),
+            next_metric=Min('journal__metrics__pk', filter=Q(journal__metrics__year__gt=F('date__year')))
+        ).exclude(
+            Q(prev_metric__isnull=True, next_metric__isnull=True)   # ignore if both are null
+        ).values_list('pk', 'prev_metric', 'next_metric')
+        to_assign = {
+            pk: past if past else future
+            for pk, past, future in pub_journal_metrics
+        }
+        to_update = models.Publication.objects.filter(pk__in=to_assign.keys())
 
-            for issn, record in list(sjrdb.items()):
-                scores = {
-                    'sjr': record['SJR'],
-                    'ifactor': record['Cites / Doc. (2years)'],
-                    'hindex': int(record['H index']),
-                    'score_date': date.today()
-                }
-                if issn in utils.IFDB:
-                    scores['ifactor'] = utils.IFDB[issn][sorted(utils.IFDB[issn].keys())[-4]]
-                models.Journal.objects.filter(issn__icontains=issn).update(**scores)
-            utils.load_metrics()
-            out += 'Updated Journal SJR meta-data on {0}'.format(date.today())
-        return out
+        if to_update.exists():
+            for pub in to_update:
+                pub.journal_metric_id = to_assign[pub.pk]
+            models.Publication.objects.bulk_update(to_update, fields=['journal_metric_id'])
+            logs.append(f'Assigned journal metric for {to_update.count()} publications.')
+        return '\n'.join(logs)

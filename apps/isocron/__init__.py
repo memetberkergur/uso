@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import re
 import threading
+import logging
 import traceback
 from datetime import time, date, datetime, timedelta
 
 import isodate
 from django.utils import timezone
-
+from django.apps import apps
+from django.db.utils import ProgrammingError
+from django.db import connection, models
+from django.core.exceptions import ImproperlyConfigured, AppRegistryNotReady
 from misc.utils import load
 
 ISO_PARSER = {
@@ -20,6 +24,8 @@ ISO_PARSER = {
 }
 
 KEEP_MESSAGES = 10
+
+logger = logging.getLogger('isocron')
 
 
 class CronJobMeta(type):
@@ -119,8 +125,9 @@ def autodiscover():
     if one does not exist. Also remove any BackgroundTask entries that do not have a corresponding cron job.
 
     """
+
     try:
-        from .models import BackgroundTask
+        BackgroundTask = apps.get_model('isocron', 'BackgroundTask')
         load('cron')
         tasks = BaseCronJob.get_all()
         existing = set(BackgroundTask.objects.values_list('name', flat=True))
@@ -141,10 +148,7 @@ def autodiscover():
         to_remove = existing - set(tasks.keys())
         if to_remove:
             BackgroundTask.objects.filter(name__in=list(to_remove)).delete()
-
-    except Exception:
+    except (AppRegistryNotReady, ProgrammingError) as e:
         # If there is an error, we do not want to crash the server, just log it
-        import logging
-        logger = logging.getLogger(__name__)
-        logger.warning("Cron job autodiscover failed. Please retry after migrations.")
+        logger.info("Cron job autodiscover failed. Please retry after migrations.")
 

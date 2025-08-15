@@ -48,7 +48,6 @@ INSTALLED_APPS = [
     'django.contrib.contenttypes',
     'django.contrib.sessions',
     'django.contrib.messages',
-    #"whitenoise.runserver_nostatic",
     'django.contrib.staticfiles',
     'django.contrib.humanize',
     'formtools',
@@ -80,7 +79,6 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
-    #'whitenoise.middleware.WhiteNoiseMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
@@ -94,10 +92,6 @@ AUTHENTICATION_BACKENDS = global_settings.AUTHENTICATION_BACKENDS + [
 ]
 AUTH_USER_MODEL = 'users.User'
 DEFAULT_AUTO_FIELD = 'django.db.models.AutoField'
-
-FIXTURE_DIRS = [
-    os.path.join(PROJECT_DIR, 'fixtures'),
-]
 
 TEMPLATES = [
     {
@@ -153,13 +147,6 @@ STATIC_ROOT = os.path.join(BASE_DIR, 'static')
 STATICFILES_DIRS = [
     os.path.join(PROJECT_DIR, "static"),
 ]
-
-# STORAGES = {
-#     "staticfiles": {
-#         "BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage",
-#     },
-# }
-
 
 MEDIA_URL = '/media/'
 MEDIA_ROOT = os.path.join(BASE_DIR, 'local/media')
@@ -235,6 +222,7 @@ USO_ASSIGNABLE_ROLES = [
 ]
 
 
+
 USO_STYLE_OVERRIDES = []
 USO_THROTTLE_KEY = get_random_bytes(16)
 USO_ADMIN_PERMS = []
@@ -242,13 +230,18 @@ USO_OPEN_WEATHER_KEY = ""
 USO_WEATHER_LOCATION = [52.14, -106.63]  # Default to CLSI
 USO_PROFILE_MANAGER = ExternalProfileManager
 USO_REVIEW_ASSIGNMENT = "MIP"    # or either "MIP" or "CMACRA" or "BRUTE_FORCE"
-USO_PDB_FACILITIES = {
-    "CLSI08B1-1": ["CMCF-ID"],
-    "CLSI08ID-1": ["CMCF-BM"],
+USO_PDB_SITE = 'XXXX'       # Protein Data Bank site code
+USO_PDB_SITE_MAP = {
 }
 
+OPEN_CITATIONS_API_KEY = None
+CROSSREF_THROTTLE = 1  # time delay between crossref calls
+CROSSREF_BATCH_SIZE = 20
+CROSSREF_API_EMAIL = None
+
+
 ROLEPERMS_DEBUG = False
-GOOGLE_API_KEY = ""
+GOOGLE_API_KEY = os.environ.get('GOOGLE_API_KEY', None)
 DYNAMIC_BREADCRUMBS_PATH_MAX_DEPTH = 8
 DYNFORMS_MIXINS = {
     'VIEW': ['roleperms.views.AdminRequiredMixin'],
@@ -258,7 +251,11 @@ REPORTCRAFT_MIXINS = {
     'VIEW': ['roleperms.views.StaffRequiredMixin'],
     'EDIT': ['roleperms.views.AdminRequiredMixin'],
 }
-
+REPORTCRAFT_FUNCTIONS = [
+    'misc.functions.String',
+    'misc.functions.JoinArray',
+    'reportcraft.functions.postgres.Join',
+]
 REPORTCRAFT_APPS = [
     'proposals',
     'projects',
@@ -288,3 +285,4 @@ USO_CODE_GENERATORS = {
 }
 
 CSRF_TRUSTED_ORIGINS = [SITE_URL]
+

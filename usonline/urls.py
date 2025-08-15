@@ -31,7 +31,7 @@ urlpatterns = [
 
     path('admin/logout/', LogoutView.as_view()),
     path('admin/', admin.site.urls),
-    path('misc/', include('misc.urls')),
+    path('', include('misc.urls')),
 ]
 
 # API URLS
@@ -42,10 +42,9 @@ for api_url in iterload('api_urls'):
 for user_url in iterload('user_urls'):
     urlpatterns += [path('user/', include(user_url))]
 
-# Add media URLS for development
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
 
 if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
     urlpatterns += [
         path('500/', TemplateView.as_view(template_name='500.html'), name='error-500'),
         path('503/', TemplateView.as_view(template_name='503.html'), name='error-503'),
