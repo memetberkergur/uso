@@ -35,6 +35,11 @@ from .filters import CycleFilterFactory
 from .models import ReviewType, Submission
 from .templatetags import proposal_tags
 
+# For PDF generation
+from django.http import HttpResponse
+from django.template.loader import render_to_string
+from weasyprint import HTML
+
 USO_ADMIN_ROLES = getattr(settings, "USO_ADMIN_ROLES", ['admin:uso'])
 USO_STAFF_ROLES = getattr(settings, "USO_STAFF_ROLES", ['staff'])
 USO_HSE_ROLES = getattr(settings, "USO_HSE_ROLES", ['staff:hse'])
@@ -493,6 +498,30 @@ class ProposalDetail(RolePermsViewMixin, detail.DetailView):
         context = super().get_context_data(**kwargs)
         context['validation'] = self.object.validate()
         return context
+
+
+class DownloadProposal(detail.DetailView):
+    model = models.Proposal
+    template_name = "proposals/proposal-download.html"
+    slug_field = 'code'
+
+
+    def get(self, request, *args, **kwargs):
+        # DetailView'den objeyi al
+        self.object = self.get_object()
+        context = self.get_context_data(object=self.object)
+
+        # Şablonu render et
+        html_string = render_to_string(self.template_name, context)
+
+        # PDF'e dönüştür
+        pdf_file = HTML(string=html_string).write_pdf()
+
+        # Response olarak PDF döndür
+        response = HttpResponse(pdf_file, content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{self.object.title}.pdf"'
+
+        return response
 
 
 class DeleteProposal(RolePermsViewMixin, ModalDeleteView):

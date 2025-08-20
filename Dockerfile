@@ -10,6 +10,8 @@ ADD . /usonline
 
 RUN set -ex && \
     apk add --no-cache --virtual libpq apache2-ssl apache2-mod-wsgi openssl bash sed libmagic py3-pip && \
+    # For PDF rendering
+    apk add --no-cache pango font-noto font-noto-cjk font-noto-extra && \ 
     python3 -m venv /venv && source /venv/bin/activate && \
     pip3 install --no-cache-dir --upgrade pip && \
     pip3 install --no-cache-dir -r /requirements.txt  && \

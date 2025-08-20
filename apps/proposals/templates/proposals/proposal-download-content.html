@@ -1,0 +1,141 @@
+{% load static %}
+{% load beamlines %}
+{% load samples_tags %}
+{% load proposal_tags %}
+{% load user_tags %}
+{% load markup %}
+
+<script src="{% static 'js/mathjax-config.js' %}" async></script>
+{% spaceless %}
+    <div class="row section">
+        <div class="col-12 section-content">
+            <div class="text-condensed text-body-secondary">
+                <a href="{{ reference.get_absolute_url }}">{{ reference }}</a>
+            </div>
+            <h2 class="border-bottom">{{ proposal.title }}</h2>
+            <strong>{{ proposal.authors }}</strong>
+        </div>
+    </div>
+    <div class="row section mt-3">
+        {% if proposal.keywords %}
+            <div class="col-sm">
+                <h6 class="mb-0">Keywords</h6>
+                <hr class="hr-xs"/>
+                {% for keyword in proposal.keywords %}
+                   <span class="badge border text-body-secondary rounded-1 me-1 mb-1">{{ keyword }}</span>
+                {% endfor %}
+            </div>
+        {% endif %}
+        {% if proposal.topics %}
+            <div class="col-sm">
+                <h6 class="mb-0">Fields of Science</h6>
+                <hr class="hr-xs"/>
+                {% for topic in proposal.topics %}
+                    <span class="badge border text-body-secondary rounded-1 me-1 mb-1">{{ topic.code }} {{ topic }}</span>
+                {% endfor %}
+            </div>
+        {% endif %}
+    </div>
+
+    {% if proposal.science.abstract %}
+        <div class="row section">
+            <div class="col-12 section-content">
+                <h3>Abstract</h3>
+                {{ proposal.science.abstract|markdown }}
+            </div>
+        </div>
+    {% endif %}
+
+    {% if content_mode != 'safety' %}
+        {% if proposal.science.scientific_merit %}
+            <div class="row section">
+                <div class="col-12 section-content">
+                    <h3>Scientific Description</h3>
+                    {{ proposal.science.scientific_merit|safe }}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if proposal.science.team_capability %}
+            <div class="row section">
+                <div class="col-12 section-content">
+                    <h3>Capability &amp; Productivity of Research Team</h3>
+                    {{ proposal.science.team_capability|markdown }}
+                </div>
+            </div>
+        {% endif %}
+
+        {% if proposal.science.societal_impact %}
+            <div class="row section">
+                <div class="col-12 section-content">
+                    <h3>Societal, Economic and Industrial Relevance</h3>
+                    {{ proposal.science.societal_impact|default:"<em>Not completed.</em>" }}
+                </div>
+            </div>
+        {% endif %}
+    {% endif %}
+    {% if proposal.science.beamline_reqs %}
+        <div class="row section">
+            <div class="col-12 section-content">
+                <h3>Facilities &amp; Techniques</h3>
+                {% show_facility_requirements proposal.science.beamline_reqs cycle=proposal.science.first_cycle %}
+            </div>
+
+            {% get_selected_ancillaries data=proposal.science.ancillaries as ancillary %}
+            {% if ancillary.labs.exists or ancillary.equipment.exists %}
+                <div class="col-12 section-content">
+                    <h3>Ancillary Requirements:</h3>
+                    {% if ancillary.labs.exists %}
+                        <p><strong>Labs:</strong>&nbsp; {{ ancillary.labs|join:", " }}</p>
+                    {% endif %}
+                    {% if ancillary.equipment.exists %}
+                        <p><strong>Equipment:</strong>&nbsp; {{ ancillary.equipment|join:", " }}</p>
+                    {% endif %}
+                </div>
+            {% endif %}
+        </div>
+    {% endif %}
+
+    {% if not content_mode or content_mode == 'safety' or content_mode == 'technical' %}
+        <div class="row section">
+            <div class="col-sm-12 section-content">
+                <h3>Materials</h3>
+                <h4>Samples:</h4>
+                {% get_samples data=proposal.safety.samples as samples %}
+                {% include "samples/sample_table.html" %}
+                {% if proposal.safety.equipment %}
+                    <h4>Equipment:</h4>
+                    <hr class="hr-xxs"/>
+                    {% include "proposals/equipment-list.html" with equipment=proposal.safety.equipment %}
+                {% endif %}
+            </div>
+        </div>
+
+
+        <div class="row section">
+            <div class="col-sm-12 section-content">
+                <h4>Sample Preparation:</h4>
+                <div>{{ proposal.safety.handling|default:"<em>No sample handling onsite.</em>" }}</div>
+            </div>
+        </div>
+        <div class="row section">
+            <div class="col-sm-12 section-content">
+                <h4>Waste Generation:</h4>
+                {% if proposal.safety.waste %}
+                    The following types of waste will be generated:
+                    <ul>
+                        {% for w in proposal.safety.waste %}
+                            <li>{{ w|waste_label }}</li>
+                        {% endfor %}
+                    </ul>
+                {% else %}
+                    <em>No waste will be generated.</em>
+                {% endif %}
+                {% if proposal.safety.disposal %}
+                    <h4>Waste Disposal:</h4>
+                    {{ proposal.safety.disposal }}
+                {% endif %}
+            </div>
+        </div>
+    {% endif %}
+{% endspaceless %}

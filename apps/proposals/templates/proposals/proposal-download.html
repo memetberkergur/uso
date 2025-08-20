@@ -1,0 +1,10 @@
+{% load static %}
+{% load misc %}
+{% load dynforms %}
+{% load beamlines %}
+{% load samples_tags %}
+{% load proposal_tags %}
+{% load user_tags %}
+{% load markup %}
+
+{% include "proposals/proposal-download-content.html" with proposal=proposal.get_document %}
