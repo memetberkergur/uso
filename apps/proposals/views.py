@@ -1555,7 +1555,6 @@ class ReviewCompatibility(RolePermsViewMixin, detail.DetailView):
 class AssignedSubmissionList(RolePermsViewMixin, ItemListView):
     model = models.Submission
     template_name = "proposals/assignment-list.html"
-    paginate_by = 5
     list_columns = ['proposal', 'cycle', 'track', 'state']
     list_filters = ['created', 'state', 'track', 'cycle']
     list_search = ['proposal__title', 'proposal__id', 'proposal__team', 'proposal__keywords',
