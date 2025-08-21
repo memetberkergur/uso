@@ -446,6 +446,10 @@ class SubmitProposal(RolePermsViewMixin, ModalUpdateView):
 
 
 class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
+    model = models.Proposal
+    template_name = 'proposals/forms/withdraw.html'  # Modal içeriği
+    slug_field = 'code'
+
     def get_queryset(self):
         slug = self.kwargs['slug']
         query = (
@@ -458,8 +462,8 @@ class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
             code=slug
         ).filter(query)
 
-    def get(self, request, *args, **kwargs):
-        proposal = self.get_queryset().first()
+    def confirmed(self, *args, **kwargs):
+        proposal = self.get_object()
         if not proposal:
             raise Http404("Proposal bulunamadı.")
 
@@ -475,10 +479,18 @@ class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
         proposal.state = proposal.STATES.draft
         proposal.save()
 
-        # Redirect without new import
-        return HttpResponseRedirect(
-            reverse('proposal-detail', kwargs={'slug': proposal.code})
+        # Activity log eklemek istersen buraya ekleyebilirsin
+        # ActivityLog.objects.log(self.request, proposal, ...)
+
+        ActivityLog.objects.log(
+            self.request, self.object, kind=ActivityLog.TYPES.task, description='Proposal withdrawn'
         )
+
+        # JSON ile yönlendirme URL'si döndür
+        return JsonResponse({
+            "url": reverse('proposal-detail', kwargs={'slug': proposal.code})
+        })
+
 
     
 class ProposalDetail(RolePermsViewMixin, detail.DetailView):
