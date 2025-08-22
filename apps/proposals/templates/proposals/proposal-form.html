@@ -1,21 +1,38 @@
 {% extends "proposals/base.html" %}
 {% load static %}
 {% load dynforms %}
+
 {% block extra_css %}
     <link href="{% static 'dynforms/dynforms.min.css' %}" rel="stylesheet"/>
     <link href="{% static 'samples/sample.min.css' %}" rel="stylesheet"/>
     <link href="{% static 'proposals/proposals.min.css' %}" rel="stylesheet"/>
+    <!-- SweetAlert2 CSS -->
+    <link href="{% static 'proposals/sweetalert2.min.css' %}" rel="stylesheet"/>
 {% endblock %}
 
 {% block pre_js %}
-        <script src="{% static 'dynforms/dynforms.min.js' %}"></script>
+    <script src="{% static 'dynforms/dynforms.min.js' %}"></script>
+    <!-- SweetAlert2 JS -->
+    <script src="{% static 'proposals/sweetalert2.min.js' %}"></script>
 {% endblock %}
 
 {% block page-title %}Edit Proposal{% endblock %}
+
 {% block content %}
     <div id="proposal-grid" class="bg-secondary-subtle">
         <div id="proposal-form" class="page">
             {% include "dynforms/form.html" %}
         </div>
     </div>
+
+    <script>
+        document.addEventListener("DOMContentLoaded", function() {
+            Swal.fire({
+                title: 'Başlık',
+                text: 'Bilgi mesajı burada yer alacak.',
+                icon: 'info',
+                confirmButtonText: 'Tamam'
+            });
+        });
+    </script>
 {% endblock %}
