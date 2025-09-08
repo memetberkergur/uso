@@ -30,7 +30,7 @@ class HSDBSearch(RolePermsViewMixin, TemplateView):
 
     def get_context_data(self, **kwargs):
         try:
-            from fuzzywuzzy import process
+            from thefuzz import process, fuzz
         except ImportError:
             process = None
 
@@ -43,7 +43,7 @@ class HSDBSearch(RolePermsViewMixin, TemplateView):
             else:
                 # Use fuzzywuzzy to find the best matches
                 choices = dict(models.HazardousSubstance.objects.values_list('pk', 'name'))
-                hits = process.extract(search_string, choices, limit=MAX_RESULTS)
+                hits = process.extract(search_string, choices, limit=MAX_RESULTS, scorer=fuzz.token_sort_ratio)
                 id_list = [v[-1] for v in hits]
                 results = models.HazardousSubstance.objects.in_bulk(id_list)
                 substances = filter(None, [results.get(pk) for pk in id_list])
@@ -123,7 +123,7 @@ class SampleField(RolePermsViewMixin, TemplateView):
 
 
 class SampleListView(RolePermsViewMixin, ItemListView):
-    queryset = models.Sample.objects.all()
+    model = models.Sample
     template_name = "item-list.html"
     paginate_by = 15
     link_url = 'sample-edit-modal'

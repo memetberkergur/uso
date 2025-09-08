@@ -1,0 +1,151 @@
+{% extends "crisp_modals/modal.html" %}
+{% block modal_title %}User Feedback{% endblock %}
+{% block modal_styles %}modal-lgx{% endblock %}
+{% block modal_body %}
+
+    <div class="row mb-3">
+        <div class="col-12">
+            <ul class="list-group list-group-flush">
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <strong>Beamline:</strong> {{ feedback.beamline }}
+                </li>
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <strong>Cycle:</strong> {{ feedback.cycle }}
+                </li>
+                {% if admin %}
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <strong>Submitted by:</strong> {{ feedback.user.get_full_name }}
+                </li>
+                {% endif %}
+                <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <strong>Submitted on:</strong> {{ feedback.created|date:"F j, Y, g:i a" }}
+                </li>
+            </ul>
+        </div>
+    </div>
+
+    {% with feedback.details as data %}
+    <div class="row g-4" style="max-height: 400px; overflow-y: scroll;">
+        {% if data.machine %}
+        <div class="col-12">
+            <div class="card h-100">
+                <div class="card-header"><strong>Machine</strong></div>
+                <ul class="list-group list-group-flush">
+                    {% for item in data.machine %}
+                    <li class="list-group-item d-flex justify-content-between align-items-center">
+                        {{ item.name }}
+                        <span class="badge bg-score-{{ item.value }}">{{ item.label }}</span>
+                    </li>
+                    {% endfor %}
+                </ul>
+            </div>
+        </div>
+        {% endif %}
+
+        {% if data.beamline %}
+        <div class="col-12">
+            <div class="card h-100">
+                <div class="card-header"><strong>Beamline</strong></div>
+                <ul class="list-group list-group-flush">
+                    {% for item in data.beamline %}
+                    <li class="list-group-item d-flex justify-content-between align-items-center">
+                        {{ item.name }}
+                        <span class="badge bg-score-{{ item.value }}">{{ item.label }}</span>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% if data.beamline_comments %}
+                <div class="card-body bg-light">
+                    <h6 class="card-subtitle mb-2 text-muted">Comments</h6>
+                    <p class="card-text"><em>"{{ data.beamline_comments }}"</em></p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if data.administration %}
+        <div class="col-12">
+            <div class="card h-100">
+                <div class="card-header"><strong>Administration</strong></div>
+                <ul class="list-group list-group-flush">
+                    {% for item in data.administration %}
+                    <li class="list-group-item d-flex justify-content-between align-items-center">
+                        {{ item.name }}
+                        <span class="badge bg-score-{{ item.value }}">{{ item.label }}</span>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% if data.administration_comments %}
+                <div class="card-body bg-light">
+                    <h6 class="card-subtitle mb-2 text-muted">Comments</h6>
+                    <p class="card-text"><em>"{{ data.administration_comments }}"</em></p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endif %}
+
+        {% if data.amenities %}
+        <div class="col-12">
+            <div class="card h-100">
+                <div class="card-header"><strong>Amenities</strong></div>
+                <ul class="list-group list-group-flush">
+                    {% for item in data.amenities %}
+                    <li class="list-group-item d-flex justify-content-between align-items-center">
+                        {{ item.name }}
+                        <span class="badge bg-score-{{ item.value }}">{{ item.label }}</span>
+                    </li>
+                    {% endfor %}
+                </ul>
+                {% if data.amenities_comments %}
+                <div class="card-body bg-light">
+                    <h6 class="card-subtitle mb-2 text-muted">Comments</h6>
+                    <p class="card-text"><em>"{{ data.amenities_comments }}"</em></p>
+                </div>
+                {% endif %}
+                {% if data.amenities_desires %}
+                <div class="card-body bg-light">
+                    <h6 class="card-subtitle mb-2 text-muted">Desired Improvements</h6>
+                    <p class="card-text"><em>"{{ data.amenities_desires }}"</em></p>
+                </div>
+                {% endif %}
+                <div class="col-12">
+                    <h5>Lodging</h5>
+                    <table class="table table-sm mt-3">
+                        <tbody>
+                            {% if data.amenities_lodging %}
+                            <tr>
+                                <th scope="row" class="w-25">Type</th>
+                                <td>{{ data.amenities_lodging }}</td>
+                            </tr>
+                            {% endif %}
+                            {% if data.amenities_lodging_reason %}
+                            <tr>
+                                <th scope="row">Reason</th>
+                                <td>{{ data.amenities_lodging_reason }}</td>
+                            </tr>
+                            {% endif %}
+                            {% if data.amenities_lodging_reason_comments %}
+                            <tr>
+                                <th scope="row">Comments</th>
+                                <td>
+                                    <em>"{{ data.amenities_lodging_reason_comments }}"</em>
+                                </td>
+                            </tr>
+                            {% endif %}
+                             {% if data.amenities_lodging_comments %}
+                            <tr>
+                                <th scope="row">General Comments</th>
+                                <td><em>"{{ data.amenities_lodging_comments }}"</em></td>
+                            </tr>
+                            {% endif %}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+        {% endif %}
+    </div>
+    {% endwith %}
+{% endblock %}
