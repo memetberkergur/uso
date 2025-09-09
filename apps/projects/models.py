@@ -16,11 +16,9 @@ from django.utils.translation import gettext as _
 from model_utils import Choices
 from model_utils.models import TimeStampedModel, TimeFramedModel
 
-from misc.fields import StringListField
 from misc.models import DateSpanMixin, Attachment, Clarification, ActivityLog, CodeModelMixin
 from proposals.models import Review, ReviewCycle
 from scheduler.models import Event, EventQuerySet
-
 
 User = getattr(settings, "AUTH_USER_MODEL")
 
@@ -34,7 +32,7 @@ class Project(DateSpanMixin, CodeModelMixin, TimeStampedModel):
     delegate = models.ForeignKey(User, related_name='+', null=True, on_delete=models.SET_NULL)
     title = models.TextField(null=True)
     team = models.ManyToManyField('users.User', related_name="projects")
-    pending_team = StringListField(blank=True, null=True)
+    pending_team = models.JSONField(default=list, blank=True)
     cycle = models.ForeignKey(
         'proposals.ReviewCycle', null=False, verbose_name=_('First Cycle'),
         related_name='projects', on_delete=models.CASCADE

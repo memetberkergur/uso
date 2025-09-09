@@ -1,7 +1,8 @@
 import itertools
+import operator
 import re
 from collections import defaultdict
-from functools import lru_cache
+from functools import lru_cache, reduce
 
 from django.conf import settings
 from django.contrib.auth import get_user_model
@@ -12,7 +13,6 @@ from django.utils.translation import gettext as _
 from model_utils import Choices
 from model_utils.models import TimeStampedModel
 
-from misc.fields import StringListField
 from misc.utils import flatten
 from scheduler.models import Event
 
@@ -205,29 +205,21 @@ class Lab(TimeStampedModel):
     name = models.CharField(max_length=255, unique=True)
     acronym = models.SlugField(max_length=20, unique=True)
     description = models.TextField(blank=True, null=True)
-    admin_roles = StringListField(null=True, blank=True)
+    admin_roles = models.JSONField(default=list, blank=True)
     permissions = models.ManyToManyField("samples.SafetyPermission", blank=True)
     details = models.JSONField(default=dict, blank=True, editable=False)
     available = models.BooleanField(default=True)
 
     def is_admin(self, user):
         """
-        Check if the user has admin permissions for this lab.
+        Check if the user has admin roles for this lab.
         """
-        _roles = []
-        for role_template in self.admin_roles or []:
-            if m := re.match(r'^(?P<role>[\w_-]+)(?::(?P<wildcard>[*]))?$', role_template):
-                role = m.group('role')
-                wildcard = m.group('wildcard')
-
-                if wildcard == '*':
-                    _roles.append(re.compile(rf"^{role.lower()}:[^:]+$"))
-                else:
-                    _roles.append(re.compile(rf"^{role_template.format(self.acronym.lower())}$"))
-        for role in user.roles:
-            if any(r.match(role) for r in _roles):
-                return True
-        return False
+        role_query = reduce(
+            operator.__or__,
+            [Q(admin_roles__iregex=f'"{role}(:.+)?"') for role in self.admin_roles],
+            Q()
+        )
+        return get_user_model().objects.filter(Q(pk=user.pk) & role_query).exists()
 
     def __str__(self):
         return self.name
@@ -263,13 +255,24 @@ class LabWorkSpace(TimeStampedModel):
 class Ancillary(TimeStampedModel):
     name = models.CharField(max_length=255, unique=True)
     description = models.TextField(blank=True, null=True)
-    admin_roles = StringListField(null=True, blank=True)
+    admin_roles = models.JSONField(default=list, blank=True)
     permissions = models.ManyToManyField("samples.SafetyPermission", blank=True)
     details = models.JSONField(default=dict, blank=True, editable=False)
     available = models.BooleanField(default=True)
 
     def __str__(self):
         return self.name
+
+    def is_admin(self, user):
+        """
+        Check if the user has admin roles for this lab.
+        """
+        role_query = reduce(
+            operator.__or__,
+            [Q(admin_roles__iregex=f'"{role}(:.+)?"') for role in self.admin_roles],
+            Q()
+        )
+        return get_user_model().objects.filter(Q(pk=user.pk) & role_query).exists()
 
     class Meta:
         verbose_name_plural = 'Ancillaries'
