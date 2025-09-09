@@ -84,39 +84,42 @@ class Notification(TimeStampedModel):
 
     def deliver(self):
         note_type = self.note_type()
-        if self.state == self.STATES.queued and note_type.kind in [MessageTemplate.TYPES.email,
-                                                                   MessageTemplate.TYPES.full]:
+        if self.state == self.STATES.queued:
             if self.user:
                 recipients = [self.user.email]
             elif self.emails:
                 recipients = self.emails
             else:
                 return
+    
             original_recipients = recipients
+    
             if NOTIFIER_FILTER:
                 recipients = list(filter(NOTIFIER_FILTER, recipients))
-
-            if settings.DEBUG or NOTIFIER_DEBUG:
-                message = "{}\n--------------\n DEBUG: INTENDED RECIPIENTS [{}]".format(
-                    self.data, ', '.join(original_recipients)
-                )
-                recipients = [u[1] for u in settings.ADMINS]
-            else:
-                message = self.data
+    
+            message = self.data
             subject = "{} {}".format(settings.EMAIL_SUBJECT_PREFIX, note_type.description)
-            success = send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, recipients, fail_silently=True)
+    
+            success = send_mail(
+                subject,
+                message,
+                settings.DEFAULT_FROM_EMAIL,
+                recipients,
+                fail_silently=False
+            )
+    
             self.state = self.STATES.sent if success else self.STATES.failed
         else:
             self.state = self.STATES.sent
+    
         self.save()
-
+    
+    
     def __str__(self):
         note_type = self.note_type()
         subject = note_type.description
         return "{}: {}".format(subject, self.user if self.user else "; ".join(self.emails))
 
-    note_type.sort_field = 'kind'
-    to.sort_field = 'user__first_name'
 
 
 class MessageTemplateQueryset(models.QuerySet):
