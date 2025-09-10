@@ -1,4 +1,7 @@
-from django.db import models
+from django.db import models, connection
+from django.db.models import Expression, OuterRef, F, Subquery, FloatField
+from django.db.models.fields.json import KeyTextTransform
+from django.db.models.functions import Cast
 
 
 class Age(models.Func):
@@ -50,6 +53,19 @@ class String(models.Func):
     def as_postgresql(self, compiler, connection):
         # CAST would be valid too, but the :: shortcut syntax is more readable.
         return self.as_sql(compiler, connection, template='%(expressions)s::text')
+
+
+class Float(models.Func):
+    """
+    Coerce an expression to a string.
+    """
+    function = 'CAST'
+    template = '%(function)s(%(expressions)s AS varchar)'
+    output_field = models.FloatField()
+
+    def as_postgresql(self, compiler, connection):
+        # CAST would be valid too, but the :: shortcut syntax is more readable.
+        return self.as_sql(compiler, connection, template='%(expressions)s::float')
 
 
 class LPad(models.Func):
@@ -140,4 +156,105 @@ class JoinIt(models.Func):
             delimiter=models.Value(self.delimiter),
             template="%(function)s(%(expressions)s, '%(delimiter)s')",
             **kwargs
+        )
+
+
+def aggregate_feedback_details_db(queryset):
+    """
+    Aggregates feedback details using database-level JSON functions.
+
+    This approach pushes the heavy lifting of aggregation to the database,
+    which can be significantly more performant than the pure Python approach
+    for very large datasets, as it avoids loading the entire 'details' JSON
+    object for every row into application memory.
+
+    NOTE: The raw SQL implementation below uses `jsonb_array_elements`, a feature
+    specific to PostgreSQL. It will not work on other database backends like
+    SQLite or MySQL without modification.
+
+    Args:
+        queryset: A Django QuerySet of Feedback objects.
+
+    Returns:
+        A dictionary containing the aggregated sum, count, and average
+        for each category.
+    """
+    # In this database-centric approach, it's often simpler to define the
+    # categories you want to aggregate beforehand. Dynamically discovering all
+    # possible keys would require a separate, more complex query.
+    categories = ['machine', 'beamline', 'amenities']
+    final_aggregates = {}
+
+    # Get the database table name from the model's metadata to make the
+    # query more robust and not dependent on a hardcoded name.
+    table_name = queryset.model._meta.db_table
+
+    # We need the primary keys from the queryset to scope the raw SQL query.
+    queryset_pks = list(queryset.values_list('pk', flat=True))
+
+    # If the queryset is empty, there's nothing to aggregate.
+    if not queryset_pks:
+        return {}
+
+    with connection.cursor() as cursor:
+        for category in categories:
+            # This raw SQL query performs the entire aggregation for one category.
+            # - `jsonb_array_elements(details->%s)`: Unnests the JSON array
+            #   for the given category into a set of virtual rows.
+            # - `(item->>'value')::integer`: Extracts the 'value' field as text
+            #   and casts it to an integer for mathematical operations.
+            # - `WHERE id = ANY(%s)`: Filters the aggregation to only include
+            #   records from the provided queryset.
+            # - `COALESCE(..., 0)`: Ensures we get 0 instead of NULL if there's
+            #   no data to aggregate.
+            sql_query = f"""
+                SELECT
+                    COALESCE(SUM((item->>'value')::integer), 0),
+                    COALESCE(COUNT(item), 0)
+                FROM
+                    {table_name},
+                    jsonb_array_elements(details->%s) AS item
+                WHERE
+                    {table_name}.id = ANY(%s)
+            """
+            cursor.execute(sql_query, [category, queryset_pks])
+            row = cursor.fetchone()
+
+            total_sum, total_count = row[0], row[1]
+
+            final_aggregates[category] = {
+                'sum': total_sum,
+                'count': total_count,
+                'average': round(total_sum / total_count, 2) if total_count > 0 else 0
+            }
+
+    return final_aggregates
+
+
+class JSONExpand(models.Func):
+    function = 'jsonb_array_elements'
+    template = '%(function)s(%(expressions)s)'
+    output_field = models.JSONField()
+
+
+class JSONAvg(models.Func):
+    """
+    Joins an array of strings into a single string with a specified separator.
+    """
+
+    output_field = models.FloatField()
+
+    def __init__(self, expressions, array_key, value_key, **extra):
+        self.array_key = str(array_key.value) if isinstance(array_key, models.Value) else str(array_key)
+        self.value_key = str(value_key.value) if isinstance(value_key, models.Value) else str(value_key)
+        super().__init__(expressions, array_key=array_key, value_key=value_key, **extra)
+
+    def as_postgresql(self, compiler, connection):
+        return self.as_sql(
+            compiler,
+            connection,
+            function="jsonb_array_avg",
+            array_key=self.array_key,
+            value_key=self.value_key,
+            template="jsonb_array_avg(%(expressions)s, '%(array_key)s', '%(value_key)s')"
         )
