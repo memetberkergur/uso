@@ -8,18 +8,18 @@ from django.db import migrations
 from django.core import serializers
 
 
-def load_fixture(apps, schema_editor):
-    fixture_path = os.path.join(
-        os.path.dirname(__file__),
-        '..',
-        'fixtures',
-        '001-reportcraft.yml'
-    )
-    db_alias = schema_editor.connection.alias
-    with open(fixture_path, 'r') as fixture_file:
-        objects = serializers.deserialize('yaml', fixture_file)
-        for obj in objects:
-            obj.save(using=db_alias)
+#def load_fixture(apps, schema_editor):
+#    fixture_path = os.path.join(
+#        os.path.dirname(__file__),
+#        '..',
+#        'fixtures',
+#        '001-reportcraft.yml'
+#    )
+#    db_alias = schema_editor.connection.alias
+#    with open(fixture_path, 'r') as fixture_file:
+#        objects = serializers.deserialize('yaml', fixture_file)
+#        for obj in objects:
+#            obj.save(using=db_alias)
 
 
 class Migration(migrations.Migration):
@@ -32,5 +32,5 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RunPython(load_fixture, reverse_code=migrations.RunPython.noop),
+        #migrations.RunPython(load_fixture, reverse_code=migrations.RunPython.noop),
     ]

@@ -25,3 +25,4 @@ local/
 static/
 local.*/
 docs/build
+.venv

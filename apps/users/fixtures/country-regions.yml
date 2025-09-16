@@ -1357,7 +1357,7 @@
     code: '788'
 - model: users.country
   fields:
-    name: Türkiye
+    name: Turkey
     alpha2: TR
     alpha3: TUR
     code: '792'
