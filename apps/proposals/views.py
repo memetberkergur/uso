@@ -440,6 +440,42 @@ class SubmitProposal(RolePermsViewMixin, ModalUpdateView):
         })
 
 
+class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
+    def get_queryset(self):
+        slug = self.kwargs['slug']
+        query = (
+            Q(leader_username=self.request.user.username) |
+            Q(spokesperson=self.request.user) |
+            Q(delegate_username=self.request.user.username)
+        )
+        return models.Proposal.objects.filter(
+            state=models.Proposal.STATES.submitted,
+            code=slug
+        ).filter(query)
+
+    def get(self, request, *args, **kwargs):
+        proposal = self.get_queryset().first()
+        if not proposal:
+            raise Http404("Proposal bulunamadı.")
+
+        # Delete submission if exists
+        submission = proposal.submissions.first()
+        if submission:
+            submission.delete()
+
+        # Unlock attachments
+        proposal.attachments.all().update(is_editable=True)
+
+        # Set state back to draft
+        proposal.state = proposal.STATES.draft
+        proposal.save()
+
+        # Redirect without new import
+        return HttpResponseRedirect(
+            reverse('proposal-detail', kwargs={'slug': proposal.code})
+        )
+
+    
 class ProposalDetail(RolePermsViewMixin, detail.DetailView):
     template_name = "proposals/proposal-detail.html"
     model = models.Proposal

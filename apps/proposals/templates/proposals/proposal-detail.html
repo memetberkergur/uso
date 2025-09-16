@@ -48,6 +48,14 @@
                 <span class="tool-label">Delete</span>
             </a>
         {% endif %}
+
+        {% if proposal.state == proposal.STATES.submitted %}
+            <a href="{% url 'withdraw-proposal' slug=object.code %}" class="pull-right">
+                <i class="bi-arrow-counterclockwise icon-md icon-fw text-warning"></i><br/>
+                <span class="tool-label">Withdraw</span>
+            </a>
+        {% endif %}
+
         <a href='#0' data-modal-url='{% url "clone-proposal" slug=object.code %}' class="pull-right">
             <i class="bi-copy icon-md icon-fw"></i><br/>
             <span class="tool-label">Clone</span>
