@@ -35,6 +35,11 @@ from .filters import CycleFilterFactory
 from .models import ReviewType, Submission
 from .templatetags import proposal_tags
 
+# For PDF generation
+from django.http import HttpResponse
+from django.template.loader import render_to_string
+from weasyprint import HTML
+
 USO_ADMIN_ROLES = getattr(settings, "USO_ADMIN_ROLES", ['admin:uso'])
 USO_STAFF_ROLES = getattr(settings, "USO_STAFF_ROLES", ['staff'])
 USO_HSE_ROLES = getattr(settings, "USO_HSE_ROLES", ['staff:hse'])
@@ -441,6 +446,10 @@ class SubmitProposal(RolePermsViewMixin, ModalUpdateView):
 
 
 class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
+    model = models.Proposal
+    template_name = 'proposals/forms/withdraw.html'  # Modal içeriği
+    slug_field = 'code'
+
     def get_queryset(self):
         slug = self.kwargs['slug']
         query = (
@@ -453,8 +462,8 @@ class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
             code=slug
         ).filter(query)
 
-    def get(self, request, *args, **kwargs):
-        proposal = self.get_queryset().first()
+    def confirmed(self, *args, **kwargs):
+        proposal = self.get_object()
         if not proposal:
             raise Http404("Proposal bulunamadı.")
 
@@ -470,10 +479,18 @@ class WithdrawProposal(RolePermsViewMixin, ModalConfirmView):
         proposal.state = proposal.STATES.draft
         proposal.save()
 
-        # Redirect without new import
-        return HttpResponseRedirect(
-            reverse('proposal-detail', kwargs={'slug': proposal.code})
+        # Activity log eklemek istersen buraya ekleyebilirsin
+        # ActivityLog.objects.log(self.request, proposal, ...)
+
+        ActivityLog.objects.log(
+            self.request, self.object, kind=ActivityLog.TYPES.task, description='Proposal withdrawn'
         )
+
+        # JSON ile yönlendirme URL'si döndür
+        return JsonResponse({
+            "url": reverse('proposal-detail', kwargs={'slug': proposal.code})
+        })
+
 
     
 class ProposalDetail(RolePermsViewMixin, detail.DetailView):
@@ -493,6 +510,30 @@ class ProposalDetail(RolePermsViewMixin, detail.DetailView):
         context = super().get_context_data(**kwargs)
         context['validation'] = self.object.validate()
         return context
+
+
+class DownloadProposal(detail.DetailView):
+    model = models.Proposal
+    template_name = "proposals/proposal-download.html"
+    slug_field = 'code'
+
+
+    def get(self, request, *args, **kwargs):
+        # DetailView'den objeyi al
+        self.object = self.get_object()
+        context = self.get_context_data(object=self.object)
+
+        # Şablonu render et
+        html_string = render_to_string(self.template_name, context)
+
+        # PDF'e dönüştür
+        pdf_file = HTML(string=html_string).write_pdf()
+
+        # Response olarak PDF döndür
+        response = HttpResponse(pdf_file, content_type="application/pdf")
+        response["Content-Disposition"] = f'inline; filename="{self.object.title}.pdf"'
+
+        return response
 
 
 class DeleteProposal(RolePermsViewMixin, ModalDeleteView):
@@ -1518,7 +1559,6 @@ class ReviewCompatibility(RolePermsViewMixin, detail.DetailView):
 class AssignedSubmissionList(RolePermsViewMixin, ItemListView):
     model = models.Submission
     template_name = "proposals/assignment-list.html"
-    paginate_by = 5
     list_columns = ['proposal', 'cycle', 'track', 'state']
     list_filters = ['created', 'state', 'track', 'cycle']
     list_search = ['proposal__title', 'proposal__id', 'proposal__team', 'proposal__keywords',
