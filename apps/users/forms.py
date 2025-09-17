@@ -169,7 +169,11 @@ class RegistrationForm(DynModelForm):
         elif User.objects.filter(Q(email__iexact=email) | Q(alt_email__iexact=email)).exists():
             raise forms.ValidationError("You already have an account in our system")
 
-        code = COUNTRY_CODES.get(country.upper(), None)
+        if country == "Türkiye":
+            code = "TR"
+        else:
+            code = COUNTRY_CODES.get(country.upper(), None)
+
         if phone:
             cleaned_phone = re.sub(r'\D', '', phone)
             try:
