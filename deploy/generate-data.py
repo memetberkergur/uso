@@ -7,9 +7,11 @@ import tempfile
 import random
 import shutil
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
+
+import dateutil.parser as date_parser
 import numpy
 import yaml
 from faker import Faker
@@ -143,6 +145,36 @@ YEARS = list(range(2009, THIS_YEAR))
 fake = Faker()
 
 
+class RandomDate:
+    def __init__(self, start, offset):
+        self.start = date_parser.parse(start)
+        self.offset = offset
+        self.index = 0
+
+    def step(self):
+        self.index += random.choice([-2, 5, -1, 1, 1, -1, 3])
+        self.index = self.index % self.offset
+        return (self.start + timedelta(days=self.index)).strftime('%Y-%m-%d')
+
+    def __call__(self):
+        return self.step()
+
+
+class RandomChooser:
+    def __init__(self, choices):
+        self.choices = choices
+        self.offset = len(choices)
+        self.index = 0
+
+    def step(self):
+        self.index += random.choice([-2, 5, -1, 1, 1, -1, 3, 1, -1])
+        self.index = self.index % self.offset
+        return self.choices[self.index]
+
+    def __call__(self):
+        return self.step()
+
+
 def random_year():
     """Generate a random year between start and end."""
     return random.choices(YEARS, weights=YEAR_WEIGHTS)[0]
@@ -193,13 +225,17 @@ class FakeUser:
                     'created': '2008-12-30 20:49:59.049236+00:00',
                     'modified': '2008-12-30 20:49:59.049236+00:00',
                     'name': 'Bespoke Facility',
-                    'location': f"Areion Prime, Valles District, The Martian Confederation",
+                    'city': 'Nome',
+                    'country': ['CAN'],
+                    'region': ['CA-SK'],
                     'sector': 'academic',
-                    'domains': f"<@bespoke.com>",
+                    'domains': ["@bespoke.com"],
                     'state': 'exempt',
                 }
             }
         }
+        self.date_chooser = RandomDate('2008-12-30', 365)
+        self.date = '2008-12-30'
         self.new_reviewers = []
         self.new_addresses = []
 
@@ -207,13 +243,17 @@ class FakeUser:
         self.reviewer_count = 1
         self.institution_count = 1
         self.address_count = 1
-
+        self.photo_offset = random.randint(1, 20) * 2
         self.user_names = defaultdict(int)
+        self.user_emails = set()
         self.facility_acronyms = {} if not facilities else facilities
 
         path = Path(name)
         self.data_path = path / 'kickstart' / '001-users.yml'
         self.photo_path = path / 'media' / 'photo'
+
+        if self.photo_path.exists():
+            shutil.rmtree(self.photo_path)
 
         self.photo_path.mkdir(parents=True, exist_ok=True)
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
@@ -226,14 +266,25 @@ class FakeUser:
             return f'{username}{self.user_names[username]}'
         return username
 
+    def make_email(self, first_name, last_name, domain):
+        base_email = unidecode(f'{first_name}.{last_name}{domain}').replace(' ', '').lower()
+        email = base_email
+        count = 1
+        while email in self.user_emails:
+            count += 1
+            email = f'{first_name}.{last_name}{count}{domain}'.replace(' ', '').lower()
+        self.user_emails.add(email)
+        return email
+
     def add_address(self, info):
+        self.address_count += 1
         pk = self.address_count
         self.new_addresses.append({
             'model': 'users.address',
             'pk': pk,
             'fields': {
-                'created': f'{info["year"]}-{info["month"]:02d}-15 20:48:59.049236+00:00',
-                'modified': f'{info["year"]}-{info["month"]:02d}-15 20:49:59.049236+00:00',
+                'created': f'{self.date} 20:48:59.049236+00:00',
+                'modified': f'{self.date} 20:49:59.049236+00:00',
                 'address_1': info['department'],
                 'address_2': f"{info['address']}",
                 'city': info['city'],
@@ -243,8 +294,6 @@ class FakeUser:
                 'phone': info['phone'],
             }
         })
-
-        self.address_count += 1
         return pk
 
     def add_reviewer(self, user, fields):
@@ -257,8 +306,8 @@ class FakeUser:
             'model': 'proposals.reviewer',
             'pk': pk,
             'fields': {
-                'created': '2024-12-30 20:49:59.049236+00:00',
-                'modified': '2024-12-30 20:49:59.049236+00:00',
+                'created': f'{self.date} 20:49:59.049236+00:00',
+                'modified': f'{self.date} 20:49:59.049236+00:00',
                 'user': user,
                 'active': True,
                 'techniques': techniques,
@@ -274,14 +323,14 @@ class FakeUser:
             'model': 'users.institution',
             'pk': self.institution_count + 1,
             'fields': {
-                'created': f'{info["year"]}-{info["month"]:02d}-15 20:48:59.049236+00:00',
-                'modified': f'{info["year"]}-{info["month"]:02d}-15 20:49:59.049236+00:00',
+                'created': f'{self.date} 20:48:59.049236+00:00',
+                'modified': f'{self.date} 20:49:59.049236+00:00',
                 'name': info['institution'],
                 'city': info['city'],
                 'region': [info['region']],
                 'country': [info['country']],
                 'sector': 'academic',
-                'domains': f"<{info['domain']}>",
+                'domains': info['domain'],
                 'state': random.choice(['pending', 'active', 'active', 'active']),
             }
         }
@@ -305,17 +354,17 @@ class FakeUser:
             address = '1 Synchrotron Way'
             department = 'Beamline Operations'
             zip_code = 'AP00-M0001'
-            roles = '<staff>'
+            roles = ['staff']
             classification = 'professional'
             fac = random.choice(list(self.facility_acronyms.values()))
             if random.choice([True, False]):
-                roles += f'<staff:{fac.lower()}>'
+                roles += [f'staff:{fac.lower()}']
                 if random.choice([True, False]):
-                    roles += f'<admin:{fac.lower()}><reviewer:{fac.lower()}>'
+                    roles += [f'admin:{fac.lower()}', f'reviewer:{fac.lower()}']
                 elif random.choice([True, False]):
-                    roles += f'<reviewer:{fac.lower()}>'
+                    roles += [f'reviewer:{fac.lower()}']
             elif random.choice([True, True, False]):
-                roles += '<{}>'.format(random.choice(ROLES))
+                roles += [random.choice(ROLES)]
             if kind == 'male':
                 first_name = fake_first_name_male(country)
             else:
@@ -324,8 +373,8 @@ class FakeUser:
         else:
             inst_info = random.choice(UNIVERSITIES)
             institution = inst_info['name']
-            domain = f"@{inst_info['domains']}"
-            roles = '<user>'
+            domain = inst_info['domain'][0] if inst_info['domain'] else f"@example.edu"
+            roles = ['user']
             country = inst_info['country']
             city = inst_info['city']
             region = inst_info['region']
@@ -345,19 +394,17 @@ class FakeUser:
         username = self.make_username(first_name, last_name, other_name)
         fields = random.sample(SUBJECTS, random.randint(2, 4))
         phone = self.fake.phone_number()[:20]
-        email = unidecode(f'{first_name}.{last_name}{domain}').replace(' ', '').lower()
+        email = self.make_email(first_name, last_name, domain)
         return {
             'country': country,
             'city': city,
             'region': region,
             'address': address,
-            'year': random_year(),
-            'month': random.randint(1, 12),
             'zip': zip_code,
             'phone': phone,
             'department': department,
             'institution': institution,
-            'domain': domain,
+            'domain': [domain],
             'classification': classification,
             'email': email,
             'first_name': first_name,
@@ -370,7 +417,7 @@ class FakeUser:
 
     def save_photo(self, username):
         photo_file = self.photo_path / f'{username}.webp'
-        photo_index = self.user_count % NUM_PHOTOS
+        photo_index = (self.user_count + self.photo_offset) % NUM_PHOTOS
         orig_file = PHOTOS_DIR / f"{photo_index:03d}.webp"
         ref_file = self.photo_path / orig_file.name
         if not ref_file.exists():
@@ -380,21 +427,22 @@ class FakeUser:
         os.symlink(ref_file.name, photo_file.name)
         os.chdir(d)
 
-    def add_user(self):
+    def add_user(self, date_string='2008-12-30'):
+        self.date = date_string
         info = self.make_random_info()
         institution = self.add_institution(info)
         address = self.add_address(info)
 
-        # 25% chance of being a reviewer if you are faculty or professional or postdoc
-        is_reviewer = random.randint(0, 100) < 25 and info['classification'] in ['faculty', 'professional', 'postdoc']
+        # 15% chance of being a reviewer if you are faculty or professional or postdoc
+        is_reviewer = random.randint(0, 100) < 15 and info['classification'] in ['faculty', 'professional', 'postdoc']
         if is_reviewer:
             pk = self.add_reviewer(self.user_count, info['fields'])
         self.new_users.append({
             'model': 'users.user',
             'pk': self.user_count,
             'fields': {
-                'created': f'{info["year"]}-{info["month"]:02d}-15 20:49:59.049236+00:00',
-                'modified': f'{info["year"]}-{info["month"]:02d}-15 21:49:59.049236+00:00',
+                'created': f'{self.date} 20:49:59.049236+00:00',
+                'modified': f'{self.date} 21:49:59.049236+00:00',
                 'password': os.environ.get('DJANGO_FAKE_PASSWORD', ''),
                 'username': info['username'],
                 'institution': institution['pk'],
@@ -404,20 +452,19 @@ class FakeUser:
                 'last_name': info['last_name'],
                 'other_names': info['other_name'],
                 'email': info['email'],
-                'roles': info['roles'] + '<reviewer>' if is_reviewer else info['roles'],
+                'roles': info['roles'] + ['reviewer'] if is_reviewer else info['roles'],
                 'photo': f"/photo/{info['username']}.webp",
                 'research_field': info['fields'],
             }
         })
-
         # save photo
         self.save_photo(info['username'])
 
-    def add_users(self, count):
+    def add_users(self, count, date_string='2008-12-30'):
         for n in range(count):
-            self.add_user()
-            if (n + 1) % 250 == 0:
-                print(f'Added {n + 1} users ...')
+            self.add_user(date_string)
+        print(f'Added {count} users ...')
+        return self.new_users
 
     def save(self):
         with open(self.data_path, 'w', encoding='utf-8') as file:
@@ -449,9 +496,9 @@ class FakeFacility:
             'model': 'proposals.facilityconfig',
             'pk': self.config_count,
             'fields': {
-                'created': '2024-12-30 20:49:59.049236+00:00',
-                'modified': '2024-12-30 20:49:59.049236+00:00',
-                'start_date': '2025-01-01',
+                'created': '2010-01-01 20:49:59.049236+00:00',
+                'modified': '2010-01-01 20:49:59.049236+00:00',
+                'start_date': '2010-01-01',
                 'accept': True,
                 'facility': facility,
                 'cycle': 1,
@@ -464,8 +511,8 @@ class FakeFacility:
                     'model': 'proposals.configitem',
                     'pk': self.config_item_count,
                     'fields': {
-                        'created': '2024-12-30 20:49:59.049236+00:00',
-                        'modified': '2024-12-30 20:49:59.049236+00:00',
+                        'created': '2010-01-01 20:49:59.049236+00:00',
+                        'modified': '2010-01-01 20:49:59.049236+00:00',
                         'config': self.config_count,
                         'technique': item,
                         'track': track,
@@ -490,8 +537,8 @@ class FakeFacility:
                 'model': 'beamlines.facility',
                 'pk': self.facility_count,
                 'fields': {
-                    'created': '2024-12-30 20:49:59.049236+00:00',
-                    'modified': '2024-12-30 20:49:59.049236+00:00',
+                    'created': f'2010-01-01 20:49:59.049236+00:00',
+                    'modified': f'2010-01-01 20:49:59.049236+00:00',
                     'name': f'{name} Beamline',
                     'port': f'{i:02d}-{source_acronym}',
                     'source': source,
@@ -521,30 +568,40 @@ class FakeFacility:
 
 
 class FakeProposal:
-    def __init__(self, name, users, facilities, techniques):
+    def __init__(self, name, facilities, techniques, num_users=150, num_proposals=250):
         self.name = name
-        self.users = users
+        self.user_gen = FakeUser(name=name, facilities=facilities)
+        self.users = []
         self.facilities = dict(facilities)
         self.techniques = techniques
         self.new_samples = []
+        self.new_cycles = []
+        self.new_schedules = []
         self.new_proposals = []
         self.new_submissions = []
+        self.new_events = []
         self.new_reviews = []
         self.review_count = 1
         self.proposal_count = 1
         self.sample_count = 1
+        self.cycle_count = 1
+        self.mode_count = 1
         self.submission_count = 1
         self.fake = Faker('la')
+        self.year = 2010
+        self.user_count_chooser = RandomChooser(list(range(num_users - num_users // 4, num_users + num_users // 4)))
+        self.proposal_count_chooser = RandomChooser(list(range(num_proposals - num_proposals // 5, num_proposals + num_proposals // 5)))
 
         path = Path(self.name)
         self.data_path = path / 'kickstart' / '003-proposals.yml'
         self.sample_path = path / 'kickstart' / '002-samples.yml'
+        self.events_path = path / 'kickstart' / '004-events.yml'
         self.data_path.parent.mkdir(parents=True, exist_ok=True)
 
-    def add_samples(self, user):
-        return [self.add_sample(user) for _ in range(random.randint(1, 5))]
+    def add_samples(self, user, date_str):
+        return [self.add_sample(user, date_str) for _ in range(random.randint(1, 4))]
 
-    def add_sample(self, user):
+    def add_sample(self, user, date_str):
         sample = random.choice(SAMPLES)
         pk = self.sample_count
         state = random.choice(SAMPLE_STATES)
@@ -554,8 +611,8 @@ class FakeProposal:
             'model': 'samples.sample',
             'pk': pk,
             'fields': {
-                'created': '2024-12-30 20:49:59.049236+00:00',
-                'modified': '2024-12-30 20:49:59.049236+00:00',
+                'created': f'{date_str} 20:49:59.049236+00:00',
+                'modified': f'{date_str} 20:49:59.049236+00:00',
                 'name': sample['name'],
                 'owner': user,
                 'source': sample['source'],
@@ -571,14 +628,14 @@ class FakeProposal:
         self.sample_count += 1
         return {'sample': f'{pk}', 'quantity': f"{quantity} {units}"}
 
-    def add_submission(self, proposal, cycle, track, techniques):
+    def add_submission(self, proposal, cycle, track, techniques, date_str):
         track_acronym = TRACKS[track]
         info = {
             'model': 'proposals.submission',
             'pk': self.submission_count,
             'fields': {
-                'created': '2025-01-30 20:49:59.049236+00:00',
-                'modified': '2025-01-30 20:49:59.049236+00:00',
+                'created': f'{date_str} 20:49:59.049236+00:00',
+                'modified': f'{date_str} 20:49:59.049236+00:00',
                 'proposal': proposal,
                 'code': f"{track_acronym}{proposal:07_}".replace('_', '-'),
                 'cycle': cycle,
@@ -591,6 +648,114 @@ class FakeProposal:
         self.new_submissions.append(info)
         self.submission_count += 1
 
+    def add_cycles(self):
+        while self.year < datetime.now().year + 1:
+            self.add_cycle()
+
+    def add_cycle(self):
+        year = self.year
+        if self.cycle_count % 2 == 1:
+            start_date = f'{year}-01-01'
+            end_date = f'{year}-12-31'
+            open_date = f'{year-1}-08-07'
+            close_date = f'{year-1}-09-07'
+            due_date = f'{year-1}-10-16'
+            alloc_date = f'{year-1}-10-30'
+            name = f'{year} Jan-Jun'
+            type_id = 1
+
+        else:
+            start_date = f'{year}-07-01'
+            end_date = f'{year+1}-01-01'
+            open_date = f'{year}-02-05'
+            close_date = f'{year}-03-05'
+            due_date = f'{year}-04-16'
+            alloc_date = f'{year}-04-30'
+            name = f'{year} Jul-Dec'
+            type_id = 2
+            self.year += 1
+
+        self.new_schedules.append({
+            'model': 'scheduler.schedule',
+            'pk': self.cycle_count,
+            'fields': {
+                'created': f'{year-1}-11-01 20:49:59.049236+00:00',
+                'modified': f'{year-1}-11-01 20:49:59.049236+00:00',
+                'description': f'{name}: Schedule',
+                'state': 'live',
+                'config_id': 1,
+                'start_date': start_date,
+                'end_date': end_date,
+            }
+        })
+        self.add_modes(self.cycle_count, start_date, end_date)
+        info = {
+            'model': 'proposals.reviewcycle',
+            'pk': self.cycle_count,
+            'fields': {
+                'created': f'{year-1}-11-01 20:49:59.049236+00:00',
+                'modified': f'{year-1}-11-01 20:49:59.049236+00:00',
+                'start_date': start_date,
+                'end_date': end_date,
+                'type_id': type_id,
+                'open_date': open_date,
+                'close_date': close_date,
+                'alloc_date': alloc_date,
+                'due_date': due_date,
+                'schedule_id': self.cycle_count,
+            }
+        }
+        self.new_cycles.append(info)
+        self.users = self.user_gen.add_users(self.user_count_chooser(), open_date)
+        self.add_proposals(self.cycle_count, self.proposal_count_chooser(), open_date)
+        self.cycle_count += 1
+
+    def add_modes(self, schedule_id, start_date, end_date):
+        start = date_parser.parse(start_date).date()
+        iso = start.isocalendar()
+        d_start = start + timedelta(days=(1 - iso.weekday))  # First Monday
+        end = date_parser.parse(end_date).date()
+        num_weeks = 0
+        shutdown_after = random.randint(12, 14)
+        shutdown_period = random.randint(3, 5)
+        while d_start < end:
+            if start > d_start:
+                shift_start = start
+            else:
+                shift_start = d_start
+            iso = shift_start.isocalendar()
+            if iso.weekday == 1:
+                shift_end = shift_start + timedelta(days=1)
+                mode = random.choice([3, 3, 3, 4, 4, 5, 2])
+            else:
+                shift_end = shift_start + timedelta(days=(7 - iso.weekday + 1))   # Next Monday
+                num_weeks += 1
+                mode = 1
+            shift_end = min(shift_end, end)
+
+            # shutdown period after 16 weeks
+            if shutdown_after < num_weeks <= shutdown_after + shutdown_period:
+                mode = 5
+
+            if shift_start.month == 12 and shift_start.day > 20:
+                mode = 5
+            self.new_events.append({
+                'model': 'scheduler.mode',
+                'pk': self.mode_count,
+                'fields': {
+                    'created': f'{start_date} 20:49:59.049236+00:00',
+                    'modified': f'{start_date} 20:49:59.049236+00:00',
+                    'start': f"{shift_start.strftime('%Y-%m-%d')} 14:00:00+00:00",
+                    'end': f"{shift_end.strftime('%Y-%m-%d')} 14:00:00+00:00",
+                    'schedule': schedule_id,
+                    'comments': '',
+                    'kind': mode,
+                    'tags': [],
+                }
+            })
+            self.mode_count += 1
+            d_start = shift_end
+
     def get_random_facility_req(self):
         facility = random.choice(list(self.techniques.keys()))
         techniques = random.sample(self.techniques[facility], random.randint(1, len(self.techniques[facility])))
@@ -599,11 +764,11 @@ class FakeProposal:
             'shifts': random.randint(1, 8),
             'techniques': techniques,
             'tags': [],
-            'procedure': self.fake.paragraph(nb_sentences=10),
-            'justification': self.fake.paragraph(nb_sentences=10),
+            'procedure': self.fake.paragraph(nb_sentences=4),
+            'justification': self.fake.paragraph(nb_sentences=4),
         }
 
-    def add_proposal(self):
+    def add_proposal(self, cycle, date_str):
         users = random.sample(self.users, random.randint(2, 5))
         areas = random.sample(SUBJECTS, random.randint(1, 3))
         facility_reqs = []
@@ -619,29 +784,31 @@ class FakeProposal:
             'email': users[1]['fields']['email']
         }
         delegate_username = users[1]['fields']['username']
-        if random.randint(0, 100) < 5:
+        if random.randint(0, 100) < 2:
             delegate = {'first_name': 'Admin', 'last_name': 'User', 'email': 'admin@bespoke.com'}
             delegate_username = 'admin'
             team = users[1:]
         else:
             team = users[2:]
 
-        cycle = random.choice([1, 2, 3, 4])
         track = random.choice([1, 2, 3])  # GA, RA, PA
+        submission_team = [
+            user['fields']['email'] for user in team
+        ]
 
         info = {
             'model': 'proposals.proposal',
             'pk': self.proposal_count,
             'fields': {
-                'created': '2025-01-30 20:49:59.049236+00:00',
-                'modified': '2025-01-30 20:49:59.049236+00:00',
+                'created': f'{date_str} 20:49:59.049236+00:00',
+                'modified': f'{date_str} 20:49:59.049236+00:00',
                 'form_type': 2,
                 'code': f"{self.proposal_count:07_}".replace('_', '-'),
                 'is_complete': False,
                 'leader_username': users[0]['fields']['username'],
                 'title': title,
                 'delegate_username': delegate_username,
-                'team': ''.join([f'<{user["fields"]["email"]}>' for user in users]),
+                'team': submission_team,
                 'state': 0,
                 'spokesperson': users[0]['pk'],
                 'areas': areas,
@@ -654,7 +821,7 @@ class FakeProposal:
                     },
                     'delegate': delegate,
                     'funding': ['NSERC', 'CIHR', 'SSHRC'],
-                    'abstract': self.fake.paragraph(nb_sentences=10),
+                    'abstract': self.fake.paragraph(nb_sentences=5),
                     'subject': {
                         'areas': areas,
                         'keywords': '; '.join([self.fake.word() for _ in range(5)])
@@ -666,11 +833,11 @@ class FakeProposal:
                          'email': user['fields']['email']}
                         for user in team
                     ],
-                    'sample_list': self.add_samples(users[0]['pk']),
+                    'sample_list': self.add_samples(users[0]['pk'], date_str),
                     'beamline_reqs': facility_reqs,
                     'pool': 1,
                     'scientific_merit': (
-                            self.fake.paragraph(nb_sentences=15)
+                            self.fake.paragraph(nb_sentences=8)
                             + random.choice(EQUATIONS)
                             + self.fake.paragraph(nb_sentences=15)
                     ),
@@ -692,45 +859,47 @@ class FakeProposal:
         if random.choice([True, False]):
             info['fields']['is_complete'] = True
             info['fields']['state'] = 1
-            self.add_submission(self.proposal_count, cycle, track, techniques)
+            self.add_submission(self.proposal_count, cycle, track, techniques, date_str)
 
         self.new_proposals.append(info)
         self.proposal_count += 1
 
-    def add_proposals(self, count):
+    def add_proposals(self, cycle, count, start_date):
+        date_chooser = RandomDate(start_date, 30)
         for _ in range(count):
-            self.add_proposal()
-        print(f'Added {count} proposals ...')
+            self.add_proposal(cycle, date_chooser())
+        print(f'Added {count} proposals for cycle {cycle}...')
 
     def save(self):
         with open(self.sample_path, 'w') as file:
             yaml.dump(self.new_samples, file, sort_keys=False)
         with open(self.data_path, 'w') as file:
+            yaml.dump(self.new_schedules, file, sort_keys=False)
+            yaml.dump(self.new_cycles, file, sort_keys=False)
             yaml.dump(self.new_proposals, file, sort_keys=False)
             yaml.dump(self.new_submissions, file, sort_keys=False)
+        with open(self.events_path, 'w') as file:
+            yaml.dump(self.new_events, file, sort_keys=False)
+
+        self.user_gen.save()
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Data Generator for USO')
     parser.add_argument('name', metavar='name', type=str, help='Directory to save data')
-    parser.add_argument('-u', '--users', type=int, help='Number of users', default=1000)
-    parser.add_argument('-p', '--proposals', type=int, help='Number of proposals', default=500)
+    parser.add_argument('-u', '--users', type=int, help='Number of users per cycle', default=100)
+    parser.add_argument('-p', '--proposals', type=int, help='Number of proposals per cycle', default=200)
     args = parser.parse_args()
 
     fac_gen = FakeFacility(name=args.name)
     fac_gen.add_facilities()
     fac_gen.save()
 
-    # generate users
-    user_gen = FakeUser(name=args.name, facilities=fac_gen.acronyms)
-    user_gen.add_users(args.users)
-    user_gen.save()
-
     # generate proposals
     prop_gen = FakeProposal(
-        name=args.name, users=user_gen.new_users, facilities=fac_gen.acronyms,
-        techniques=fac_gen.techniques
+        name=args.name, facilities=fac_gen.acronyms,
+        techniques=fac_gen.techniques,  num_users=args.users, num_proposals=args.proposals,
     )
-    prop_gen.add_proposals(args.proposals)
+    prop_gen.add_cycles()
     prop_gen.save()
     print('All Done.')
