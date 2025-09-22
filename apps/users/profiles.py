@@ -13,25 +13,28 @@ class ExternalProfileManager:
     @classmethod
     def create_username(cls, profile: dict) -> str:
         """
-        Create a username from the profile. This is used to create a username for a new user.
-        :param profile: dictionary of profile parameters containing first_name and last_name
-        :return: unique username string
+        Create a username for a new user.
+        In this version, the username is always the email address.
+
+        :param profile: dictionary containing first_name, last_name, and email
+        :return: username string (must be unique)
+        :raises ValueError: if required fields are missing or username already exists
         """
         User = get_user_model()
-        if 'first_name' in profile and 'last_name' in profile:
-            first_initial = '' if not profile['first_name'] else profile['first_name'][0]
-            count = 0
-            suffix = '' if count == 0 else count
-            username = f'{profile["last_name"]}{first_initial}{suffix}'.lower()
 
-            while User.objects.filter(username=username).exists():
-                count += 1
-                suffix = '' if count == 0 else count
-                username = f'{profile["last_name"]}{first_initial}{suffix}'.lower()
+        # Required fields check
+        if 'first_name' in profile and 'last_name' in profile and 'email' in profile:
+            username = profile['email'].lower()
+
+            # If the email is already used as a username, raise an error
+            if User.objects.filter(username=username).exists():
+                raise ValueError(f"Username '{username}' already exists.")
 
             return username
         else:
-            raise ValueError('First name and last name are required to create a username.')
+            raise ValueError('First name, last name, and email are required to create a username.')
+
+
 
     @classmethod
     def fetch_profile(cls, username: str) -> dict:
