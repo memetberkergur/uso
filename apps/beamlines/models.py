@@ -58,6 +58,10 @@ class Facility(TimeStampedModel):
     flux = models.CharField(max_length=255, null=True, blank=True)
     resolution = models.CharField("Spectral Resolution", max_length=255, null=True, blank=True)
     source = models.CharField("Source Type", max_length=255, null=True, blank=True)
+    # For Tarla
+    pulse_duration = models.CharField("Pulse Duration", max_length=255, null=True, blank=True)
+    energy_per_pulse = models.CharField("Energy per pulse", max_length=255, null=True, blank=True)
+    repetition_rate = models.CharField("Repetition Rate", max_length=255, null=True)    
     state = models.CharField(max_length=20, choices=States.choices, default=States.design)
     parent = models.ForeignKey(
         "Facility", null=True, blank=True, related_name="children",
